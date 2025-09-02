@@ -1,0 +1,23 @@
+INFO:     Will watch for changes in these directories: ['/Users/andreb/Downloads/notes-api']
+INFO:     Uvicorn running on http://127.0.0.1:8000 (Press CTRL+C to quit)
+INFO:     Started reloader process [63124] using WatchFiles
+INFO:     Started server process [63164]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     127.0.0.1:53717 - "GET /healthz HTTP/1.1" 200 OK
+INFO:     127.0.0.1:53728 - "POST /notes HTTP/1.1" 201 Created
+INFO:     127.0.0.1:53738 - "GET /notes HTTP/1.1" 200 OK
+INFO:     127.0.0.1:53746 - "GET /notes HTTP/1.1" 200 OK
+INFO:     127.0.0.1:53760 - "GET /notes/1 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:53768 - "PUT /notes/1 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:53747 - "GET /notes HTTP/1.1" 200 OK
+INFO:     127.0.0.1:53747 - "GET /notes HTTP/1.1" 200 OK
+INFO:     127.0.0.1:53792 - "POST /notes HTTP/1.1" 201 Created
+INFO:     127.0.0.1:53795 - "POST /notes HTTP/1.1" 201 Created
+INFO:     127.0.0.1:53797 - "POST /notes HTTP/1.1" 201 Created
+INFO:     127.0.0.1:53800 - "POST /notes HTTP/1.1" 201 Created
+INFO:     127.0.0.1:53801 - "POST /notes HTTP/1.1" 201 Created
+INFO:     127.0.0.1:53785 - "GET /notes HTTP/1.1" 200 OK
+INFO:     127.0.0.1:54055 - "GET /notes HTTP/1.1" 200 OK
+INFO:     127.0.0.1:54055 - "GET /notes HTTP/1.1" 200 OK
+INFO:     127.0.0.1:54055 - "GET /notes HTTP/1.1" 200 OK
