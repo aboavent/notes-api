@@ -1,0 +1,102 @@
+name: "JFrog OIDC CI Workflow with Full Security Scan (Docker)"
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  PYTHON_VERSION: ${{ vars.PYTHON_VERSION || '3.11' }}
+  BUILD_NAME: ${{ vars.BUILD_NAME || 'jfrog-docker-security-scan-build' }}
+  BUILD_NUMBER: ${{ vars.BUILD_NUMBER || github.run_id }}
+  GENERIC_REPO: ${{ vars.GENERIC_REPO || 'my-generic-repo' }}
+  DOCKER_REPO: ${{ vars.DOCKER_REPO || 'myrepo-docker' }}
+  UPLOAD_PATTERN: ${{ vars.UPLOAD_PATTERN || '**/*' }}
+  UPLOAD_EXCLUSIONS: ${{ vars.UPLOAD_EXCLUSIONS || '**/.git/**;**/.github/**;**/.jfrog/**' }}
+  FAIL_ON_VULNS: ${{ vars.FAIL_ON_VULNS || 'false' }}
+
+jobs:
+  build-scan-and-publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup JFrog CLI (OIDC)
+        uses: jfrog/setup-jfrog-cli@v4
+        env:
+          JF_URL: ${{ vars.JF_URL }}
+        with:
+          oidc-provider-name: github-oidc-integration
+
+      - name: Ensure jq is available
+        shell: bash
+        run: |
+          if ! command -v jq >/dev/null 2>&1; then
+            sudo apt-get update -y && sudo apt-get install -y jq
+          fi
+
+      - name: "Sanity: show effective settings"
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "DOCKER_REPO=${{ env.DOCKER_REPO }}"
+          echo "GENERIC_REPO=${{ env.GENERIC_REPO }}"
+          echo "UPLOAD_EXCLUSIONS=${{ env.UPLOAD_EXCLUSIONS }}"
+          jf rt curl -s -XGET "/api/repositories/${{ env.DOCKER_REPO }}" | jq '{key,packageType,type,repositories,defaultDeploymentRepo}'
+          {
+            echo "### JFrog Settings"
+            echo "- **JF_URL**: \`${{ vars.JF_URL }}\`"
+            echo "- **DOCKER_REPO**: \`${{ env.DOCKER_REPO }}\`"
+            echo "- **GENERIC_REPO**: \`${{ env.GENERIC_REPO }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Source/Secrets/IaC scan (non-blocking)
+      - name: Scan repository (non-blocking)
+        shell: bash
+        run: jf scan . --fail=false --format table
+
+      # Refresh OIDC so the install starts with a fresh token
+      - name: Re-authenticate JFrog CLI (refresh OIDC)
+        uses: jfrog/setup-jfrog-cli@v4
+        env:
+          JF_URL: ${{ vars.JF_URL }}
+        with:
+          oidc-provider-name: github-oidc-integration
+
+      # Build Docker image
+      - name: Build Docker image
+        shell: bash
+        run: |
+          docker build -t notes-api:latest .
+
+      # Tag Docker image for Artifactory
+      - name: Tag Docker image
+        shell: bash
+        run: |
+          docker tag notes-api:latest ${{ vars.JF_URL }}/${{ env.DOCKER_REPO }}/notes-api:latest
+
+      # Login to JFrog Docker registry
+      - name: Docker login to JFrog
+        shell: bash
+        run: |
+          echo "Logging in to JFrog Docker registry..."
+          jf docker-login ${{ vars.JF_URL }}
+
+      # Push Docker image to Artifactory
+      - name: Push Docker image to Artifactory
+        shell: bash
+        run: |
+          docker push ${{ vars.JF_URL }}/${{ env.DOCKER_REPO }}/notes-api:latest
+
+      # Publish & Scan the build
+      - name: Publish build info
+        shell: bash
+        run: jf rt bp "${{ env.BUILD_NAME }}" "${{ env.BUILD_NUMBER }}"
+
+      - name: Scan published build (policy-gated)
+        shell: bash
+        run: jf bs "${{ env.BUILD_NAME }}" "${{ env.BUILD_NUMBER }}" --fail=${{ env.FAIL_ON_VULNS }}
