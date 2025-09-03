@@ -12,9 +12,8 @@ env:
   PYTHON_VERSION: ${{ vars.PYTHON_VERSION || '3.11' }}
   BUILD_NAME: ${{ vars.BUILD_NAME || 'jfrog-docker-security-scan-build' }}
   BUILD_NUMBER: ${{ vars.BUILD_NUMBER || github.run_id }}
-  GENERIC_REPO: ${{ vars.GENERIC_REPO || 'my-generic-repo' }}
-  DOCKER_REPO:  ${{ vars.DOCKER_REPO  || 'myrepo-docker' }}
-  JF_REGISTRY:  ${{ vars.JF_REGISTRY  || 'aboavent.jfrog.io' }} # host only
+  DOCKER_REPO:  ${{ vars.DOCKER_REPO  || 'notes-api-docker-repo' }}
+  JF_REGISTRY:  ${{ vars.JF_REGISTRY  || 'aboavent.jfrog.io' }} # host ONLY (no https)
   FAIL_ON_SEVERITY: ${{ vars.FAIL_ON_SEVERITY || 'none' }}       # none|low|medium|high|critical
   XRAY_FORMAT: table
   UPLOAD_PATTERN: ${{ vars.UPLOAD_PATTERN || '**/*' }}
@@ -30,43 +29,41 @@ jobs:
       - name: Setup JFrog CLI (OIDC)
         uses: jfrog/setup-jfrog-cli@v4
         env:
-          JF_URL: ${{ vars.JF_URL }}
+          JF_URL: ${{ vars.JF_URL }}                      # e.g., https://aboavent.jfrog.io
         with:
           oidc-provider-name: github-oidc-integration
 
       - name: Ensure jq is available
         shell: bash
         run: |
-          if ! command -v jq >/dev/null 2>&1; then
+          set -euo pipefail
+          if ! command -v jq >/dev/null 2nd; then
             sudo apt-get update -y && sudo apt-get install -y jq
           fi
 
-      - name: "Sanity: verify Artifactory Docker repo exists"
+      - name: "Sanity: show effective settings"
         shell: bash
         run: |
           set -euo pipefail
           echo "DOCKER_REPO=${{ env.DOCKER_REPO }}"
-          if ! jf rt curl -sf -XGET "/api/repositories/${{ env.DOCKER_REPO }}" > repo.json; then
-            echo "::error::Artifactory Docker repo '${{ env.DOCKER_REPO }}' not found at ${{ vars.JF_URL }}"
-            exit 1
-          fi
-          jq '{key,packageType,type}' repo.json || cat repo.json
+          jf rt curl -s -XGET "/api/repositories/${{ env.DOCKER_REPO }}" | jq '{key,packageType,type,repositories,defaultDeploymentRepo}'
           {
             echo "### JFrog Settings"
             echo "- **JF_URL**: \`${{ vars.JF_URL }}\`"
             echo "- **DOCKER_REPO**: \`${{ env.DOCKER_REPO }}\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
-      # SAST/Secrets/IaC scan (non-blocking) – source code
-      - name: Scan repository (non-blocking)
+      # ---------- Source SCA/SAST/Secrets/IaC audit (non-blocking) ----------
+      - name: Repo audit (non-blocking)
         shell: bash
-        run: jf scan . --fail=false --format "${{ env.XRAY_FORMAT }}"
+        run: jf audit . --fail=false --format "${{ env.XRAY_FORMAT }}"
 
-      # Build
+      # ---------- Build Docker image ----------
       - name: Compose image tags
         id: tags
         shell: bash
         run: |
+          set -euo pipefail
           NAME="notes-api"
           SHA_TAG="${{ env.JF_REGISTRY }}/${{ env.DOCKER_REPO }}/${NAME}:${GITHUB_SHA}"
           SAFE_BRANCH=$(echo "${GITHUB_REF_NAME:-main}" | tr '/ ' '--')
@@ -77,43 +74,46 @@ jobs:
       - name: Build image (local)
         shell: bash
         run: |
+          set -euo pipefail
           docker build -t "${{ steps.tags.outputs.sha_tag }}" -t "${{ steps.tags.outputs.ref_tag }}" .
 
-      # Optional pre-push image scan (with tar fallback)
-      - name: Image scan (local; fallback to tar)
+      # ---------- Pre-push Xray scan of local image ----------
+      - name: Image scan (local with Docker)
         shell: bash
         run: |
           set -euo pipefail
           IMG="${{ steps.tags.outputs.sha_tag }}"
-          echo "Verifying local image: ${IMG}"
-          if docker inspect "${IMG}" >/dev/null 2>&1; then
-            echo "Scanning with Xray (local daemon)…"
-            jf scan "docker://${IMG}" --fail=false --format "${{ env.XRAY_FORMAT }}" || {
-              echo "Direct scan failed; saving image to tar and scanning tar as fallback…"
-              docker save "${IMG}" -o image.tar
-              jf scan "image.tar" --fail=false --format "${{ env.XRAY_FORMAT }}"
-            }
-          else
-            echo "::warning::Local image '${IMG}' not found; skipping pre-push scan."
-          fi
+          echo "Scanning local image with Xray: ${IMG}"
+          jf docker scan "${IMG}" --fail=false --format "${{ env.XRAY_FORMAT }}"
 
-      # PUSH (new syntax). Build info via env vars.
-      - name: Push image & record build-info
-        env:
-          JFROG_CLI_BUILD_NAME: ${{ env.BUILD_NAME }}
-          JFROG_CLI_BUILD_NUMBER: ${{ env.BUILD_NUMBER }}
+      # ---------- Login & push to Artifactory (new docker syntax) ----------
+      - name: Docker login to Artifactory
         shell: bash
         run: |
-          jf docker push "${{ steps.tags.outputs.sha_tag }}"
-          jf docker push "${{ steps.tags.outputs.ref_tag }}"
+          set -euo pipefail
+          jf docker login "${{ env.JF_REGISTRY }}"
 
+      - name: Push images (record build-info)
+        env:
+          BUILD_NAME: ${{ env.BUILD_NAME }}
+          BUILD_NUMBER: ${{ env.BUILD_NUMBER }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          jf docker push "${{ steps.tags.outputs.sha_tag }}" --build-name "${BUILD_NAME}" --build-number "${BUILD_NUMBER}"
+          jf docker push "${{ steps.tags.outputs.ref_tag }}" --build-name "${BUILD_NAME}" --build-number "${BUILD_NUMBER}"
+
+      # ---------- Publish build-info ----------
       - name: Publish build-info
         env:
           BUILD_NAME: ${{ env.BUILD_NAME }}
           BUILD_NUMBER: ${{ env.BUILD_NUMBER }}
         shell: bash
-        run: jf rt build-publish "${BUILD_NAME}" "${BUILD_NUMBER}"
+        run: |
+          set -euo pipefail
+          jf rt build-publish "${BUILD_NAME}" "${BUILD_NUMBER}"
 
+      # ---------- Xray Build Scan (policy-gated) ----------
       - name: Scan published build (policy-gated)
         env:
           BUILD_NAME: ${{ env.BUILD_NAME }}
@@ -121,6 +121,7 @@ jobs:
           FAIL_ON_SEVERITY: ${{ env.FAIL_ON_SEVERITY }}
         shell: bash
         run: |
+          set -euo pipefail
           if [ "${FAIL_ON_SEVERITY}" = "none" ]; then
             jf bs "${BUILD_NAME}" "${BUILD_NUMBER}" || true
           else
