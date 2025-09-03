@@ -12,14 +12,11 @@ env:
   PYTHON_VERSION: ${{ vars.PYTHON_VERSION || '3.11' }}
   BUILD_NAME: ${{ vars.BUILD_NAME || 'jfrog-docker-security-scan-build' }}
   BUILD_NUMBER: ${{ vars.BUILD_NUMBER || github.run_id }}
-  # Artifactory repos / registry
   GENERIC_REPO: ${{ vars.GENERIC_REPO || 'my-generic-repo' }}
-  DOCKER_REPO:  ${{ vars.DOCKER_REPO  || 'myrepo-docker' }}     # <-- you created this
-  JF_REGISTRY:  ${{ vars.JF_REGISTRY  || 'aboavent.jfrog.io' }} # host ONLY (no https)
-  # Scanning behavior
+  DOCKER_REPO:  ${{ vars.DOCKER_REPO  || 'myrepo-docker' }}
+  JF_REGISTRY:  ${{ vars.JF_REGISTRY  || 'aboavent.jfrog.io' }} # host only
   FAIL_ON_SEVERITY: ${{ vars.FAIL_ON_SEVERITY || 'none' }}       # none|low|medium|high|critical
   XRAY_FORMAT: table
-  # Upload filters (not used here, kept for parity)
   UPLOAD_PATTERN: ${{ vars.UPLOAD_PATTERN || '**/*' }}
   UPLOAD_EXCLUSIONS: ${{ vars.UPLOAD_EXCLUSIONS || '**/.git/**;**/.github/**;**/.jfrog/**' }}
 
@@ -33,7 +30,7 @@ jobs:
       - name: Setup JFrog CLI (OIDC)
         uses: jfrog/setup-jfrog-cli@v4
         env:
-          JF_URL: ${{ vars.JF_URL }}                      # e.g., https://aboavent.jfrog.io
+          JF_URL: ${{ vars.JF_URL }}
         with:
           oidc-provider-name: github-oidc-integration
 
@@ -44,7 +41,6 @@ jobs:
             sudo apt-get update -y && sudo apt-get install -y jq
           fi
 
-      # NICE-TO-HAVE: fail early if the Docker repo doesn't exist
       - name: "Sanity: verify Artifactory Docker repo exists"
         shell: bash
         run: |
@@ -54,23 +50,19 @@ jobs:
             echo "::error::Artifactory Docker repo '${{ env.DOCKER_REPO }}' not found at ${{ vars.JF_URL }}"
             exit 1
           fi
-          if command -v jq >/dev/null; then
-            jq '{key,packageType,type}' repo.json
-          else
-            cat repo.json
-          fi
+          jq '{key,packageType,type}' repo.json || cat repo.json
           {
             echo "### JFrog Settings"
             echo "- **JF_URL**: \`${{ vars.JF_URL }}\`"
             echo "- **DOCKER_REPO**: \`${{ env.DOCKER_REPO }}\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
-      # ---------- Source scan: SAST / Secrets / IaC (non-blocking) ----------
+      # SAST/Secrets/IaC scan (non-blocking) – source code
       - name: Scan repository (non-blocking)
         shell: bash
         run: jf scan . --fail=false --format "${{ env.XRAY_FORMAT }}"
 
-      # ---------- Build Docker image ----------
+      # Build
       - name: Compose image tags
         id: tags
         shell: bash
@@ -87,7 +79,7 @@ jobs:
         run: |
           docker build -t "${{ steps.tags.outputs.sha_tag }}" -t "${{ steps.tags.outputs.ref_tag }}" .
 
-      # ---------- Image scan (local) with tar fallback ----------
+      # Optional pre-push image scan (with tar fallback)
       - name: Image scan (local; fallback to tar)
         shell: bash
         run: |
@@ -105,19 +97,16 @@ jobs:
             echo "::warning::Local image '${IMG}' not found; skipping pre-push scan."
           fi
 
-      # ---------- Push via modern wrapper (no deprecated warning) ----------
+      # PUSH (new syntax). Build info via env vars.
       - name: Push image & record build-info
         env:
-          BUILD_NAME: ${{ env.BUILD_NAME }}
-          BUILD_NUMBER: ${{ env.BUILD_NUMBER }}
+          JFROG_CLI_BUILD_NAME: ${{ env.BUILD_NAME }}
+          JFROG_CLI_BUILD_NUMBER: ${{ env.BUILD_NUMBER }}
         shell: bash
         run: |
-          jf docker push "${{ steps.tags.outputs.sha_tag }}" --repo "${{ env.DOCKER_REPO }}" \
-            --build-name "${BUILD_NAME}" --build-number "${BUILD_NUMBER}"
-          jf docker push "${{ steps.tags.outputs.ref_tag }}" --repo "${{ env.DOCKER_REPO }}" \
-            --build-name "${BUILD_NAME}" --build-number "${BUILD_NUMBER}"
+          jf docker push "${{ steps.tags.outputs.sha_tag }}"
+          jf docker push "${{ steps.tags.outputs.ref_tag }}"
 
-      # ---------- Publish build-info ----------
       - name: Publish build-info
         env:
           BUILD_NAME: ${{ env.BUILD_NAME }}
@@ -125,7 +114,6 @@ jobs:
         shell: bash
         run: jf rt build-publish "${BUILD_NAME}" "${BUILD_NUMBER}"
 
-      # ---------- Xray Build Scan (policy-gated) ----------
       - name: Scan published build (policy-gated)
         env:
           BUILD_NAME: ${{ env.BUILD_NAME }}
