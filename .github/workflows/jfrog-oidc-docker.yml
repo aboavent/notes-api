@@ -49,7 +49,7 @@ jobs:
       # ---------- Source scan: SAST / Secrets / IaC (non-blocking) ----------
       - name: Scan repository (non-blocking)
         shell: bash
-        run: jf scan . --fail=false --format "${XRAY_FORMAT}"
+        run: jf scan . --fail=false --format "${{ env.XRAY_FORMAT }}"
 
       # ---------- Build Docker image ----------
       - name: Compose image tags
@@ -70,7 +70,7 @@ jobs:
       # ---------- Optional: image scan before push ----------
       - name: Image scan (Xray, non-blocking)
         shell: bash
-        run: jf scan "docker://${{ steps.tags.outputs.sha_tag }}" --fail=false --format "${XRAY_FORMAT}"
+        run: jf scan "docker://${{ steps.tags.outputs.sha_tag }}" --fail=false --format "${{ env.XRAY_FORMAT }}"
 
       # ---------- Docker login to Artifactory ----------
       - name: Docker login (Artifactory via JF CLI)
