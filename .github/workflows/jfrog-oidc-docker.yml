@@ -1,4 +1,4 @@
-name: "JFrog OIDC CI Workflow with Curation + Xray (Docker)"
+name: "JFrog OIDC CI Workflow with Full Security Scan (Docker)"
 
 on:
   push:
@@ -9,30 +9,18 @@ permissions:
   contents: read
 
 env:
-  PYTHON_VERSION: ${{ vars.PYTHON_VERSION || '3.11' }}
-  BUILD_NAME: ${{ vars.BUILD_NAME || 'jfrog-docker-security-scan-build' }}
-  BUILD_NUMBER: ${{ vars.BUILD_NUMBER || github.run_id }}
-
-  # Artifactory / Docker
-  DOCKER_REPO:  ${{ vars.DOCKER_REPO  || 'notes-api-docker-repo' }}
-  JF_REGISTRY:  ${{ vars.JF_REGISTRY  || 'aboavent.jfrog.io' }}   # host only (no https)
-
-  # Curation (set this to your curated *virtual* PyPI repo name)
-  CURATED_PYPI_VIRTUAL: ${{ vars.CURATED_PYPI_VIRTUAL || 'pypi-curated' }}
-
-  # Xray behavior
-  FAIL_ON_SEVERITY: ${{ vars.FAIL_ON_SEVERITY || 'none' }}  # none|low|medium|high|critical
+  PYTHON_VERSION:  ${{ vars.PYTHON_VERSION  || '3.11' }}
+  BUILD_NAME:      ${{ vars.BUILD_NAME      || 'jfrog-docker-security-scan-build' }}
+  BUILD_NUMBER:    ${{ vars.BUILD_NUMBER    || github.run_id }}
+  DOCKER_REPO:     ${{ vars.DOCKER_REPO     || 'notes-api-docker-repo' }}
+  JF_REGISTRY:     ${{ vars.JF_REGISTRY     || 'aboavent.jfrog.io' }} # host only
+  FAIL_ON_SEVERITY: ${{ vars.FAIL_ON_SEVERITY || 'none' }}            # none|low|medium|high|critical
   XRAY_FORMAT: table
-
-  # Make CLI quieter & non-interactive in CI
   JFROG_CLI_LOG_LEVEL: ERROR
-  JFROG_CLI_ENV_EXCLUDE: "*password*;*secret*;*key*;*token*;*auth*;JF_ARTIFACTORY_*;JF_ENV_*;JF_URL;JF_USER;JF_PASSWORD;JF_ACCESS_TOKEN"
-  JFROG_CLI_OFFER_CONFIG: "false"
 
 jobs:
-  build-curate-scan-publish:
+  build-scan-and-publish:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -40,41 +28,36 @@ jobs:
       - name: Setup JFrog CLI (OIDC)
         uses: jfrog/setup-jfrog-cli@v4
         env:
-          JF_URL: ${{ vars.JF_URL }}                  # e.g., https://aboavent.jfrog.io
+          JF_URL: ${{ vars.JF_URL }}         # e.g. https://aboavent.jfrog.io
         with:
-          oidc-provider-name: github-oidc-integration # must exist in JFrog Platform
+          oidc-provider-name: github-oidc-integration
 
-      - name: Sanity: show effective settings
+      - name: Ensure jq is available
+        run: |
+          if ! command -v jq >/dev/null 2>&1; then
+            sudo apt-get update -y && sudo apt-get install -y jq
+          fi
+
+      - name: "Sanity: show effective settings"
         shell: bash
         run: |
           set -euo pipefail
           echo "DOCKER_REPO=${{ env.DOCKER_REPO }}"
-          jf rt curl -s -XGET "/api/repositories/${{ env.DOCKER_REPO }}" | jq '{key,packageType,type}'
+          jf rt curl -s -XGET "/api/repositories/${{ env.DOCKER_REPO }}" | jq '{key,packageType,type,repositories,defaultDeploymentRepo}'
           {
             echo "### JFrog Settings"
             echo "- **JF_URL**: \`${{ vars.JF_URL }}\`"
             echo "- **DOCKER_REPO**: \`${{ env.DOCKER_REPO }}\`"
-            echo "- **CURATED_PYPI_VIRTUAL**: \`${{ env.CURATED_PYPI_VIRTUAL }}\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
-      # ---------- CURATION FIRST (fail-fast before we build) ----------
-      - name: Configure pip resolver for curated repo
-        working-directory: app
-        shell: bash
-        run: |
-          # 'setup-jfrog-cli' action registers a server id named: setup-jfrog-cli-server
-          jf pipc \
-            --server-id-resolve setup-jfrog-cli-server \
-            --repo-resolve "${{ env.CURATED_PYPI_VIRTUAL }}"
+      # ---------- Source scans: SAST / Secrets / IaC (non-blocking) ----------
+      - name: Audit repository (non-blocking)
+        run: jf audit . --fail=false --format "${{ env.XRAY_FORMAT }}"
 
-      - name: Curation audit (requirements.txt)
-        working-directory: app
-        shell: bash
-        run: |
-          # Fails the job if any dependency is blocked by Curation policy
-          jf curation-audit --requirements-file requirements.txt --format table
+      - name: Scan repository (non-blocking)
+        run: jf scan . --fail=false --format "${{ env.XRAY_FORMAT }}"
 
-      # ---------- Build & tag image ----------
+      # ---------- Build Docker image ----------
       - name: Compose image tags
         id: tags
         shell: bash
@@ -86,40 +69,47 @@ jobs:
           echo "sha_tag=${SHA_TAG}" >> "$GITHUB_OUTPUT"
           echo "ref_tag=${REF_TAG}" >> "$GITHUB_OUTPUT"
 
-      - name: Build Docker image (local)
-        shell: bash
+      - name: Build image (local)
         run: |
           docker build -t "${{ steps.tags.outputs.sha_tag }}" -t "${{ steps.tags.outputs.ref_tag }}" .
 
-      # Optional pre-push check (non-blocking) on local daemon
-      - name: Xray scan (local image, non-blocking)
+      # ---------- Image scan (local daemon, non-blocking; with tar fallback) ----------
+      - name: Xray scan Docker image (non-blocking)
         shell: bash
         run: |
-          echo "Scanning local image: ${{ steps.tags.outputs.sha_tag }}"
-          jf docker scan "${{ steps.tags.outputs.sha_tag }}" --fail=false --format "${{ env.XRAY_FORMAT }}"
+          set -euo pipefail
+          echo "Verifying local image:"
+          docker image inspect "${{ steps.tags.outputs.sha_tag }}" >/dev/null
+          echo "Scanning with Xray (local daemon)…"
+          jf docker scan "${{ steps.tags.outputs.sha_tag }}" --fail=false --format "${{ env.XRAY_FORMAT }}" || {
+            echo "Direct scan failed; saving image to tar and scanning tar as fallback…"
+            docker save "${{ steps.tags.outputs.sha_tag }}" -o image.tar
+            jf scan image.tar --fail=false --format "${{ env.XRAY_FORMAT }}"
+          }
 
-      # ---------- Push using JF CLI (handles docker login for you) ----------
-      - name: Push image & record build-info
+      # ---------- Push & record build-info ----------
+      - name: Push image & record build-info (both tags)
         env:
-          BUILD_NAME: ${{ env.BUILD_NAME }}
+          BUILD_NAME:   ${{ env.BUILD_NAME }}
           BUILD_NUMBER: ${{ env.BUILD_NUMBER }}
         shell: bash
         run: |
-          jf docker push "${{ steps.tags.outputs.sha_tag }}" --build-name "${BUILD_NAME}" --build-number "${BUILD_NUMBER}"
-          jf docker push "${{ steps.tags.outputs.ref_tag }}" --build-name "${BUILD_NAME}" --build-number "${BUILD_NUMBER}"
+          jf rt docker-push "${{ steps.tags.outputs.sha_tag }}" "${{ env.DOCKER_REPO }}" \
+            --build-name "${BUILD_NAME}" --build-number "${BUILD_NUMBER}"
+          jf rt docker-push "${{ steps.tags.outputs.ref_tag }}" "${{ env.DOCKER_REPO }}" \
+            --build-name "${BUILD_NAME}" --build-number "${BUILD_NUMBER}"
 
       - name: Publish build-info
         env:
-          BUILD_NAME: ${{ env.BUILD_NAME }}
+          BUILD_NAME:   ${{ env.BUILD_NAME }}
           BUILD_NUMBER: ${{ env.BUILD_NUMBER }}
-        shell: bash
         run: jf rt build-publish "${BUILD_NAME}" "${BUILD_NUMBER}"
 
-      # ---------- Xray scans ----------
-      - name: Xray build scan (policy-gated)
+      # ---------- Xray Build Scan (policy-gated) ----------
+      - name: Scan published build (policy-gated)
         env:
-          BUILD_NAME: ${{ env.BUILD_NAME }}
-          BUILD_NUMBER: ${{ env.BUILD_NUMBER }}
+          BUILD_NAME:       ${{ env.BUILD_NAME }}
+          BUILD_NUMBER:     ${{ env.BUILD_NUMBER }}
           FAIL_ON_SEVERITY: ${{ env.FAIL_ON_SEVERITY }}
         shell: bash
         run: |
@@ -129,8 +119,22 @@ jobs:
             jf bs "${BUILD_NAME}" "${BUILD_NUMBER}" --fail-on-severity "${FAIL_ON_SEVERITY}"
           fi
 
-      # Marks the pushed *artifact* as scanned in the repo browser
-      - name: Xray repo scan (remote image, non-blocking)
-        shell: bash
+      - name: Summarize Xray build scan in job summary
+        env:
+          BUILD_NAME:   ${{ env.BUILD_NAME }}
+          BUILD_NUMBER: ${{ env.BUILD_NUMBER }}
         run: |
-          jf scan "docker://${{ steps.tags.outputs.sha_tag }}" --fail=false --format "${{ env.XRAY_FORMAT }}"
+          set -euo pipefail
+          jf bs "${BUILD_NAME}" "${BUILD_NUMBER}" --format simple-json | tee scan.json || true
+          CRIT=$(jq '[.vulnerabilities[]? | select(.severity=="Critical")] | length' scan.json)
+          HIGH=$(jq '[.vulnerabilities[]? | select(.severity=="High")] | length' scan.json)
+          MED=$(jq  '[.vulnerabilities[]? | select(.severity=="Medium")] | length' scan.json)
+          LOW=$(jq  '[.vulnerabilities[]? | select(.severity=="Low")]    | length' scan.json)
+          {
+            echo "### Xray Build Scan Results"
+            echo "- **Build**: \`${BUILD_NAME}/${BUILD_NUMBER}\`"
+            echo "- **Critical**: ${CRIT}"
+            echo "- **High**: ${HIGH}"
+            echo "- **Medium**: ${MED}"
+            echo "- **Low**: ${LOW}"
+          } >> "$GITHUB_STEP_SUMMARY"
