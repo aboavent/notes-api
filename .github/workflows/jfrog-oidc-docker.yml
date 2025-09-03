@@ -34,7 +34,14 @@ jobs:
         env:
           JF_URL: ${{ vars.JF_URL }}                      # e.g., https://aboavent.jfrog.io
         with:
-          oidc-provider-name: github-oidc-integration     # must exist in JFrog Platform
+          oidc-provider-name: github-oidc-integration
+
+      - name: Ensure jq is available
+        shell: bash
+        run: |
+          if ! command -v jq >/dev/null 2>&1; then
+            sudo apt-get update -y && sudo apt-get install -y jq
+          fi
 
       - name: "Sanity: show effective settings"
         shell: bash
@@ -48,14 +55,14 @@ jobs:
             echo "- **DOCKER_REPO**: \`${{ env.DOCKER_REPO }}\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
-      # ---------- 1) Audit source dependencies (pre-build; non-blocking) ----------
+      # 1) Audit source dependencies (pre-build; non-blocking)
       - name: Audit source deps (pre-build)
         shell: bash
         run: |
           set -euo pipefail
           jf audit "${{ env.AUDIT_TARGET }}" --fail=false --format "${{ env.XRAY_FORMAT }}"
 
-      # ---------- Build Docker image ----------
+      # Build Docker image
       - name: Compose image tags
         id: tags
         shell: bash
@@ -74,7 +81,7 @@ jobs:
           set -euo pipefail
           docker build -t "${{ steps.tags.outputs.sha_tag }}" -t "${{ steps.tags.outputs.ref_tag }}" .
 
-      # ---------- 2) Image scan (try docker://, then tar fallback) ----------
+      # 2) Image scan (docker URI with tar fallback)
       - name: Image scan (Xray; docker URI with tar fallback)
         shell: bash
         env:
@@ -91,12 +98,12 @@ jobs:
             jf scan image.tar --fail=false --format "${XRAY_FORMAT}"
           fi
 
-      # ---------- Push image & record build-info ----------
+      # Login & push via JF CLI to record build-info
       - name: Docker login (Artifactory via JF CLI)
         shell: bash
         run: |
           set -euo pipefail
-          jf docker-login ${{ env.JF_REGISTRY }}
+          jf rt docker-login ${{ env.JF_REGISTRY }}
 
       - name: Push image & record build-info
         shell: bash
@@ -119,7 +126,7 @@ jobs:
           set -euo pipefail
           jf rt build-publish "${BUILD_NAME}" "${BUILD_NUMBER}"
 
-      # ---------- 3) Policy-gated build scan ----------
+      # 3) Policy-gated build scan
       - name: Scan published build (policy-gated)
         shell: bash
         env:
