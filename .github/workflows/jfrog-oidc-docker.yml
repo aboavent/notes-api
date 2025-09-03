@@ -12,11 +12,16 @@ env:
   PYTHON_VERSION: ${{ vars.PYTHON_VERSION || '3.11' }}
   BUILD_NAME: ${{ vars.BUILD_NAME || 'jfrog-docker-security-scan-build' }}
   BUILD_NUMBER: ${{ vars.BUILD_NUMBER || github.run_id }}
+  # Artifactory repos / registry
   GENERIC_REPO: ${{ vars.GENERIC_REPO || 'my-generic-repo' }}
-  DOCKER_REPO: ${{ vars.DOCKER_REPO || 'myrepo-docker' }}
+  DOCKER_REPO:  ${{ vars.DOCKER_REPO  || 'myrepo-docker' }}
+  JF_REGISTRY:  ${{ vars.JF_REGISTRY  || 'aboavent.jfrog.io' }} # <-- host ONLY (no https)
+  # Scanning behavior
+  FAIL_ON_SEVERITY: ${{ vars.FAIL_ON_SEVERITY || 'none' }}       # none|low|medium|high|critical
+  XRAY_FORMAT: table
+  # Upload filters (kept from your template; not used here)
   UPLOAD_PATTERN: ${{ vars.UPLOAD_PATTERN || '**/*' }}
   UPLOAD_EXCLUSIONS: ${{ vars.UPLOAD_EXCLUSIONS || '**/.git/**;**/.github/**;**/.jfrog/**' }}
-  FAIL_ON_VULNS: ${{ vars.FAIL_ON_VULNS || 'false' }}
 
 jobs:
   build-scan-and-publish:
@@ -28,75 +33,79 @@ jobs:
       - name: Setup JFrog CLI (OIDC)
         uses: jfrog/setup-jfrog-cli@v4
         env:
-          JF_URL: ${{ vars.JF_URL }}
+          JF_URL: ${{ vars.JF_URL }}                      # e.g., https://aboavent.jfrog.io
         with:
-          oidc-provider-name: github-oidc-integration
+          oidc-provider-name: github-oidc-integration     # must exist in JFrog Platform
 
-      - name: Ensure jq is available
-        shell: bash
-        run: |
-          if ! command -v jq >/dev/null 2>&1; then
-            sudo apt-get update -y && sudo apt-get install -y jq
-          fi
-
-      - name: "Sanity: show effective settings"
+      - name: Sanity: show effective settings
         shell: bash
         run: |
           set -euo pipefail
+          echo "JF_URL=${{ vars.JF_URL }}"
+          echo "JF_REGISTRY=${{ env.JF_REGISTRY }}"
           echo "DOCKER_REPO=${{ env.DOCKER_REPO }}"
-          echo "GENERIC_REPO=${{ env.GENERIC_REPO }}"
-          echo "UPLOAD_EXCLUSIONS=${{ env.UPLOAD_EXCLUSIONS }}"
-          jf rt curl -s -XGET "/api/repositories/${{ env.DOCKER_REPO }}" | jq '{key,packageType,type,repositories,defaultDeploymentRepo}'
-          {
-            echo "### JFrog Settings"
-            echo "- **JF_URL**: \`${{ vars.JF_URL }}\`"
-            echo "- **DOCKER_REPO**: \`${{ env.DOCKER_REPO }}\`"
-            echo "- **GENERIC_REPO**: \`${{ env.GENERIC_REPO }}\`"
-          } >> "$GITHUB_STEP_SUMMARY"
+          jf rt curl -s -XGET "/api/repositories/${{ env.DOCKER_REPO }}" | jq '{key,packageType,type}'
 
-      # Source/Secrets/IaC scan (non-blocking)
+      # ---------- Source scan: SAST / Secrets / IaC (non-blocking) ----------
       - name: Scan repository (non-blocking)
         shell: bash
-        run: jf scan . --fail=false --format table
+        run: jf scan . --fail=false --format "${XRAY_FORMAT}"
 
-      # Refresh OIDC so the install starts with a fresh token
-      - name: Re-authenticate JFrog CLI (refresh OIDC)
-        uses: jfrog/setup-jfrog-cli@v4
+      # ---------- Build Docker image ----------
+      - name: Compose image tags
+        id: tags
+        shell: bash
+        run: |
+          NAME="notes-api"
+          SHA_TAG="${{ env.JF_REGISTRY }}/${{ env.DOCKER_REPO }}/${NAME}:${GITHUB_SHA}"
+          SAFE_BRANCH=$(echo "${GITHUB_REF_NAME:-main}" | tr '/ ' '--')
+          REF_TAG="${{ env.JF_REGISTRY }}/${{ env.DOCKER_REPO }}/${NAME}:${SAFE_BRANCH}"
+          echo "sha_tag=${SHA_TAG}"   >> "$GITHUB_OUTPUT"
+          echo "ref_tag=${REF_TAG}"   >> "$GITHUB_OUTPUT"
+
+      - name: Build image (local)
+        run: |
+          docker build -t "${{ steps.tags.outputs.sha_tag }}" -t "${{ steps.tags.outputs.ref_tag }}" .
+
+      # ---------- Optional: image scan before push ----------
+      - name: Image scan (Xray, non-blocking)
+        shell: bash
+        run: jf scan "docker://${{ steps.tags.outputs.sha_tag }}" --fail=false --format "${XRAY_FORMAT}"
+
+      # ---------- Docker login to Artifactory ----------
+      - name: Docker login (Artifactory via JF CLI)
+        run: jf docker-login ${{ env.JF_REGISTRY }}
+
+      # ---------- Push via JF CLI to record build-info ----------
+      - name: Push image & record build-info
         env:
-          JF_URL: ${{ vars.JF_URL }}
-        with:
-          oidc-provider-name: github-oidc-integration
-
-      # Build Docker image
-      - name: Build Docker image
+          BUILD_NAME: ${{ env.BUILD_NAME }}
+          BUILD_NUMBER: ${{ env.BUILD_NUMBER }}
         shell: bash
         run: |
-          docker build -t notes-api:latest .
+          jf rt docker-push "${{ steps.tags.outputs.sha_tag }}" "${{ env.DOCKER_REPO }}" \
+            --build-name "${BUILD_NAME}" --build-number "${BUILD_NUMBER}"
+          jf rt docker-push "${{ steps.tags.outputs.ref_tag }}" "${{ env.DOCKER_REPO }}" \
+            --build-name "${BUILD_NAME}" --build-number "${BUILD_NUMBER}"
 
-      # Tag Docker image for Artifactory
-      - name: Tag Docker image
-        shell: bash
-        run: |
-          docker tag notes-api:latest ${{ vars.JF_URL }}/${{ env.DOCKER_REPO }}/notes-api:latest
+      # ---------- Publish build-info ----------
+      - name: Publish build-info
+        env:
+          BUILD_NAME: ${{ env.BUILD_NAME }}
+          BUILD_NUMBER: ${{ env.BUILD_NUMBER }}
+        run: jf rt build-publish "${BUILD_NAME}" "${BUILD_NUMBER}"
 
-      # Login to JFrog Docker registry
-      - name: Docker login to JFrog
-        shell: bash
-        run: |
-          echo "Logging in to JFrog Docker registry..."
-          jf docker-login ${{ vars.JF_URL }}
-
-      # Push Docker image to Artifactory
-      - name: Push Docker image to Artifactory
-        shell: bash
-        run: |
-          docker push ${{ vars.JF_URL }}/${{ env.DOCKER_REPO }}/notes-api:latest
-
-      # Publish & Scan the build
-      - name: Publish build info
-        shell: bash
-        run: jf rt bp "${{ env.BUILD_NAME }}" "${{ env.BUILD_NUMBER }}"
-
+      # ---------- Xray Build Scan (policy-gated) ----------
       - name: Scan published build (policy-gated)
+        env:
+          BUILD_NAME: ${{ env.BUILD_NAME }}
+          BUILD_NUMBER: ${{ env.BUILD_NUMBER }}
+          FAIL_ON_SEVERITY: ${{ env.FAIL_ON_SEVERITY }}
         shell: bash
-        run: jf bs "${{ env.BUILD_NAME }}" "${{ env.BUILD_NUMBER }}" --fail=${{ env.FAIL_ON_VULNS }}
+        run: |
+          if [ "${FAIL_ON_SEVERITY}" = "none" ]; then
+            # Do not fail the pipeline on findings
+            jf bs "${BUILD_NAME}" "${BUILD_NUMBER}" || true
+          else
+            jf bs "${BUILD_NAME}" "${BUILD_NUMBER}" --fail-on-severity "${FAIL_ON_SEVERITY}"
+          fi
