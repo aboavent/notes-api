@@ -37,14 +37,17 @@ jobs:
         with:
           oidc-provider-name: github-oidc-integration     # must exist in JFrog Platform
 
-      - name: Sanity: show effective settings
+      - name: "Sanity: show effective settings"
         shell: bash
         run: |
           set -euo pipefail
-          echo "JF_URL=${{ vars.JF_URL }}"
-          echo "JF_REGISTRY=${{ env.JF_REGISTRY }}"
           echo "DOCKER_REPO=${{ env.DOCKER_REPO }}"
-          jf rt curl -s -XGET "/api/repositories/${{ env.DOCKER_REPO }}" | jq '{key,packageType,type}'
+          jf rt curl -s -XGET "/api/repositories/${{ env.DOCKER_REPO }}" | jq '{key,packageType,type,repositories,defaultDeploymentRepo}'
+          {
+            echo "### JFrog Settings"
+            echo "- **JF_URL**: \`${{ vars.JF_URL }}\`"
+            echo "- **DOCKER_REPO**: \`${{ env.DOCKER_REPO }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       # ---------- Source scan: SAST / Secrets / IaC (non-blocking) ----------
       - name: Scan repository (non-blocking)
