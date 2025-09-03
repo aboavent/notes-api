@@ -7,18 +7,18 @@ on:
 permissions:
   id-token: write
   contents: read
-  security-events: write   # needed to upload SARIF to GitHub Code Scanning
+  security-events: write   # for SARIF uploads
 
 env:
   PYTHON_VERSION: ${{ vars.PYTHON_VERSION || '3.11' }}
   BUILD_NAME:     ${{ vars.BUILD_NAME     || 'jfrog-docker-security-scan-build' }}
   BUILD_NUMBER:   ${{ vars.BUILD_NUMBER   || github.run_id }}
-  # Artifactory Docker repo / registry
   DOCKER_REPO:    ${{ vars.DOCKER_REPO    || 'notes-api-docker-repo' }}
   JF_REGISTRY:    ${{ vars.JF_REGISTRY    || 'aboavent.jfrog.io' }} # host only (no https)
-  # Scanning behavior
   FAIL_ON_SEVERITY: ${{ vars.FAIL_ON_SEVERITY || 'none' }}  # none|low|medium|high|critical
   XRAY_FORMAT: table
+  # Silence JFrog CLI so SARIF is clean JSON
+  JFROG_CLI_LOG_LEVEL: ERROR
 
 jobs:
   build-scan-and-publish:
@@ -30,7 +30,7 @@ jobs:
       - name: Setup JFrog CLI (OIDC)
         uses: jfrog/setup-jfrog-cli@v4
         env:
-          JF_URL: ${{ vars.JF_URL }}                      # e.g., https://aboavent.jfrog.io
+          JF_URL: ${{ vars.JF_URL }}
         with:
           oidc-provider-name: github-oidc-integration
 
@@ -57,9 +57,13 @@ jobs:
         run: jf scan . --fail=false --format "${{ env.XRAY_FORMAT }}"
 
       - name: Xray scan source (SARIF -> GitHub Security)
+        shell: bash
         run: |
+          set -euo pipefail
           mkdir -p sarif
-          jf scan . --fail=false --format sarif > sarif/source.sarif
+          jf scan . --fail=false --format sarif 1> sarif/source.sarif
+          # Validate SARIF (must have top-level 'runs')
+          jq -e '.runs' sarif/source.sarif >/dev/null
 
       - name: Upload source scan SARIF
         uses: github/codeql-action/upload-sarif@v3
@@ -85,9 +89,12 @@ jobs:
 
       # ---------- Image scan (local) -> SARIF ----------
       - name: Xray scan Docker image (SARIF -> GitHub Security)
+        shell: bash
         run: |
+          set -euo pipefail
           mkdir -p sarif
-          jf docker scan "${{ steps.tags.outputs.sha_tag }}" --format sarif > sarif/docker.sarif
+          jf docker scan "${{ steps.tags.outputs.sha_tag }}" --format sarif 1> sarif/docker.sarif
+          jq -e '.runs' sarif/docker.sarif >/dev/null
 
       - name: Upload Docker scan SARIF
         uses: github/codeql-action/upload-sarif@v3
@@ -102,7 +109,6 @@ jobs:
           BUILD_NUMBER: ${{ env.BUILD_NUMBER }}
         shell: bash
         run: |
-          # Use jf rt docker-push so build-info is captured automatically
           jf rt docker-push "${{ steps.tags.outputs.sha_tag }}" "${{ env.DOCKER_REPO }}" \
             --build-name "${BUILD_NAME}" --build-number "${BUILD_NUMBER}"
           jf rt docker-push "${{ steps.tags.outputs.ref_tag }}" "${{ env.DOCKER_REPO }}" \
