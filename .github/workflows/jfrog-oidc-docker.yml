@@ -12,18 +12,13 @@ env:
   PYTHON_VERSION: ${{ vars.PYTHON_VERSION || '3.11' }}
   BUILD_NAME: ${{ vars.BUILD_NAME || 'jfrog-docker-security-scan-build' }}
   BUILD_NUMBER: ${{ vars.BUILD_NUMBER || github.run_id }}
-
-  # Artifactory / Docker registry
   DOCKER_REPO:  ${{ vars.DOCKER_REPO  || 'myrepo-docker' }}
-  JF_REGISTRY:  ${{ vars.JF_REGISTRY  || 'aboavent.jfrog.io' }}   # host only (no https)
-
-  # Scanning behavior
-  FAIL_ON_SEVERITY: ${{ vars.FAIL_ON_SEVERITY || 'none' }}         # none|low|medium|high|critical
-  XRAY_FORMAT: ${{ vars.XRAY_FORMAT || 'table' }}
-  AUDIT_TARGET: ${{ vars.AUDIT_TARGET || 'app' }}                  # where pyproject/requirements live
+  JF_REGISTRY:  ${{ vars.JF_REGISTRY  || 'aboavent.jfrog.io' }}  # host only (no https)
+  FAIL_ON_SEVERITY: ${{ vars.FAIL_ON_SEVERITY || 'none' }}       # none|low|medium|high|critical
+  XRAY_FORMAT: table
 
 jobs:
-  build-scan-and-publish:
+  build-audit-scan-publish:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -32,12 +27,11 @@ jobs:
       - name: Setup JFrog CLI (OIDC)
         uses: jfrog/setup-jfrog-cli@v4
         env:
-          JF_URL: ${{ vars.JF_URL }}                      # e.g., https://aboavent.jfrog.io
+          JF_URL: ${{ vars.JF_URL }}             # e.g. https://aboavent.jfrog.io
         with:
           oidc-provider-name: github-oidc-integration
 
       - name: Ensure jq is available
-        shell: bash
         run: |
           if ! command -v jq >/dev/null 2>&1; then
             sudo apt-get update -y && sudo apt-get install -y jq
@@ -55,19 +49,15 @@ jobs:
             echo "- **DOCKER_REPO**: \`${{ env.DOCKER_REPO }}\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
-      # 1) Audit source dependencies (pre-build; non-blocking)
-      - name: Audit source deps (pre-build)
-        shell: bash
-        run: |
-          set -euo pipefail
-          jf audit "${{ env.AUDIT_TARGET }}" --fail=false --format "${{ env.XRAY_FORMAT }}"
+      # 1) Source SCA/SAST/Secrets/IaC (non-blocking) - 'audit' first
+      - name: JFrog Audit (source) – non-blocking
+        run: jf audit . --fail=false --format ${{ env.XRAY_FORMAT }}
 
-      # Build Docker image
+      # 2) Build & tag image
       - name: Compose image tags
         id: tags
         shell: bash
         run: |
-          set -euo pipefail
           NAME="notes-api"
           SHA_TAG="${{ env.JF_REGISTRY }}/${{ env.DOCKER_REPO }}/${NAME}:${GITHUB_SHA}"
           SAFE_BRANCH=$(echo "${GITHUB_REF_NAME:-main}" | tr '/ ' '--')
@@ -76,65 +66,45 @@ jobs:
           echo "ref_tag=${REF_TAG}" >> "$GITHUB_OUTPUT"
 
       - name: Build image (local)
-        shell: bash
         run: |
-          set -euo pipefail
           docker build -t "${{ steps.tags.outputs.sha_tag }}" -t "${{ steps.tags.outputs.ref_tag }}" .
 
-      # 2) Image scan (docker URI with tar fallback)
-      - name: Image scan (Xray; docker URI with tar fallback)
-        shell: bash
-        env:
-          IMG_TAG: ${{ steps.tags.outputs.sha_tag }}
-          XRAY_FORMAT: ${{ env.XRAY_FORMAT }}
-        run: |
-          set -euo pipefail
-          echo "Trying docker:// scan for ${IMG_TAG} ..."
-          if jf scan "docker://${IMG_TAG}" --fail=false --format "${XRAY_FORMAT}"; then
-            echo "docker:// scan succeeded."
-          else
-            echo "docker:// scan failed; saving to tar and scanning tar as fallback..."
-            docker save "${IMG_TAG}" -o image.tar
-            jf scan image.tar --fail=false --format "${XRAY_FORMAT}"
-          fi
-
-      # Login & push via JF CLI to record build-info
-      - name: Docker login (Artifactory via JF CLI)
+      # 3) Local image scan (works without remote existence)
+      - name: Scan image locally (tar fallback, non-blocking)
         shell: bash
         run: |
           set -euo pipefail
-          jf rt docker-login ${{ env.JF_REGISTRY }}
+          echo "Saving image to tar for local scan…"
+          docker save "${{ steps.tags.outputs.sha_tag }}" -o image.tar
+          jf scan image.tar --fail=false --format "${{ env.XRAY_FORMAT }}"
 
+      # 4) Push via JF CLI (uses OIDC config; no docker login needed)
       - name: Push image & record build-info
-        shell: bash
         env:
           BUILD_NAME: ${{ env.BUILD_NAME }}
           BUILD_NUMBER: ${{ env.BUILD_NUMBER }}
+        shell: bash
         run: |
-          set -euo pipefail
           jf rt docker-push "${{ steps.tags.outputs.sha_tag }}" "${{ env.DOCKER_REPO }}" \
             --build-name "${BUILD_NAME}" --build-number "${BUILD_NUMBER}"
           jf rt docker-push "${{ steps.tags.outputs.ref_tag }}" "${{ env.DOCKER_REPO }}" \
             --build-name "${BUILD_NAME}" --build-number "${BUILD_NUMBER}"
 
+      # 5) Publish build-info
       - name: Publish build-info
-        shell: bash
         env:
           BUILD_NAME: ${{ env.BUILD_NAME }}
           BUILD_NUMBER: ${{ env.BUILD_NUMBER }}
-        run: |
-          set -euo pipefail
-          jf rt build-publish "${BUILD_NAME}" "${BUILD_NUMBER}"
+        run: jf rt build-publish "${BUILD_NAME}" "${BUILD_NUMBER}"
 
-      # 3) Policy-gated build scan
+      # 6) Xray Build Scan (policy-gated)
       - name: Scan published build (policy-gated)
-        shell: bash
         env:
           BUILD_NAME: ${{ env.BUILD_NAME }}
           BUILD_NUMBER: ${{ env.BUILD_NUMBER }}
           FAIL_ON_SEVERITY: ${{ env.FAIL_ON_SEVERITY }}
+        shell: bash
         run: |
-          set -euo pipefail
           if [ "${FAIL_ON_SEVERITY}" = "none" ]; then
             jf bs "${BUILD_NAME}" "${BUILD_NUMBER}" || true
           else
