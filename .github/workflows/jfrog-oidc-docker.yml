@@ -1,4 +1,4 @@
-name: "JFrog OIDC CI Workflow with Full Security Scan (Docker)"
+name: "JFrog OIDC CI Workflow with Audit & Image Scan (Docker)"
 
 on:
   push:
@@ -10,17 +10,18 @@ permissions:
 
 env:
   PYTHON_VERSION: ${{ vars.PYTHON_VERSION || '3.11' }}
-  BUILD_NAME: ${{ vars.BUILD_NAME || 'jfrog-docker-security-scan-build' }}
-  BUILD_NUMBER: ${{ vars.BUILD_NUMBER || github.run_id }}
-  # Artifactory repos / registry
+  BUILD_NAME:     ${{ vars.BUILD_NAME     || 'jfrog-docker-security-scan-build' }}
+  BUILD_NUMBER:   ${{ vars.BUILD_NUMBER   || github.run_id }}
+  # Artifactory / Registry
   GENERIC_REPO: ${{ vars.GENERIC_REPO || 'my-generic-repo' }}
   DOCKER_REPO:  ${{ vars.DOCKER_REPO  || 'myrepo-docker' }}
-  JF_REGISTRY:  ${{ vars.JF_REGISTRY  || 'aboavent.jfrog.io' }} # host ONLY (no https)
+  JF_REGISTRY:  ${{ vars.JF_REGISTRY  || 'aboavent.jfrog.io' }}   # host ONLY (no https)
+  JF_URL:       ${{ vars.JF_URL }}                                 # e.g. https://aboavent.jfrog.io
   # Scanning behavior
-  FAIL_ON_SEVERITY: ${{ vars.FAIL_ON_SEVERITY || 'none' }}       # none|low|medium|high|critical
+  FAIL_ON_SEVERITY: ${{ vars.FAIL_ON_SEVERITY || 'none' }}         # none|low|medium|high|critical
   XRAY_FORMAT: table
-  # Upload filters (kept from your template; not used here)
-  UPLOAD_PATTERN: ${{ vars.UPLOAD_PATTERN || '**/*' }}
+  # (kept for reference; not used directly here)
+  UPLOAD_PATTERN:    ${{ vars.UPLOAD_PATTERN    || '**/*' }}
   UPLOAD_EXCLUSIONS: ${{ vars.UPLOAD_EXCLUSIONS || '**/.git/**;**/.github/**;**/.jfrog/**' }}
 
 jobs:
@@ -33,9 +34,16 @@ jobs:
       - name: Setup JFrog CLI (OIDC)
         uses: jfrog/setup-jfrog-cli@v4
         env:
-          JF_URL: ${{ vars.JF_URL }}                      # e.g., https://aboavent.jfrog.io
+          JF_URL: ${{ env.JF_URL }}
         with:
-          oidc-provider-name: github-oidc-integration     # must exist in JFrog Platform
+          oidc-provider-name: github-oidc-integration
+
+      - name: Ensure jq is available
+        shell: bash
+        run: |
+          if ! command -v jq >/dev/null 2>&1; then
+            sudo apt-get update -y && sudo apt-get install -y jq
+          fi
 
       - name: "Sanity: show effective settings"
         shell: bash
@@ -45,16 +53,22 @@ jobs:
           jf rt curl -s -XGET "/api/repositories/${{ env.DOCKER_REPO }}" | jq '{key,packageType,type,repositories,defaultDeploymentRepo}'
           {
             echo "### JFrog Settings"
-            echo "- **JF_URL**: \`${{ vars.JF_URL }}\`"
+            echo "- **JF_URL**: \`${{ env.JF_URL }}\`"
+            echo "- **JF_REGISTRY**: \`${{ env.JF_REGISTRY }}\`"
             echo "- **DOCKER_REPO**: \`${{ env.DOCKER_REPO }}\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
-      # ---------- NEW: Audit dependencies first (SCA/SBOM) ----------
-      - name: Audit dependencies (pre-build, non-blocking)
+      # ---------- 1) AUDIT: deps SBOM+SCA (non-blocking here) ----------
+      - name: Audit dependencies (non-blocking)
         shell: bash
-        run: jf audit . --format "${{ env.XRAY_FORMAT }}" --fail=false
+        run: jf audit . --fail=false --format "${{ env.XRAY_FORMAT }}"
 
-      # ---------- Build Docker image ----------
+      # ---------- 2) REPO SCAN: SAST / Secrets / IaC (non-blocking) ----------
+      - name: Scan repository (non-blocking)
+        shell: bash
+        run: jf scan . --fail=false --format "${{ env.XRAY_FORMAT }}"
+
+      # ---------- 3) BUILD IMAGE ----------
       - name: Compose image tags
         id: tags
         shell: bash
@@ -63,48 +77,62 @@ jobs:
           SHA_TAG="${{ env.JF_REGISTRY }}/${{ env.DOCKER_REPO }}/${NAME}:${GITHUB_SHA}"
           SAFE_BRANCH=$(echo "${GITHUB_REF_NAME:-main}" | tr '/ ' '--')
           REF_TAG="${{ env.JF_REGISTRY }}/${{ env.DOCKER_REPO }}/${NAME}:${SAFE_BRANCH}"
-          echo "sha_tag=${SHA_TAG}"   >> "$GITHUB_OUTPUT"
-          echo "ref_tag=${REF_TAG}"   >> "$GITHUB_OUTPUT"
+          echo "sha_tag=${SHA_TAG}" >> "$GITHUB_OUTPUT"
+          echo "ref_tag=${REF_TAG}" >> "$GITHUB_OUTPUT"
 
-      - name: Build image (local)
+      - name: Build Docker image
+        shell: bash
         run: |
           docker build -t "${{ steps.tags.outputs.sha_tag }}" -t "${{ steps.tags.outputs.ref_tag }}" .
 
-      # ---------- Scan AFTER image is created ----------
-      - name: Image scan (Xray, non-blocking)
+      # ---------- 4) IMAGE SCAN: try local; if missing, pull then scan ----------
+      - name: Image scan (Xray; local with pull fallback)
         shell: bash
-        run: jf scan "docker://${{ steps.tags.outputs.sha_tag }}" --fail=false --format "${{ env.XRAY_FORMAT }}"
+        env:
+          IMG_TAG: ${{ steps.tags.outputs.sha_tag }}
+          XRAY_FORMAT: ${{ env.XRAY_FORMAT }}
+          JF_REGISTRY: ${{ env.JF_REGISTRY }}
+        run: |
+          set -euo pipefail
+          if docker image inspect "${IMG_TAG}" >/dev/null 2>&1; then
+            echo "Scanning local image: ${IMG_TAG}"
+          else
+            echo "Local image not found. Pulling from registry, then scanning..."
+            jf docker-login "${JF_REGISTRY}"
+            docker pull "${IMG_TAG}"
+          fi
+          jf scan "docker://${IMG_TAG}" --fail=false --format "${XRAY_FORMAT}"
 
-      # ---------- Docker login to Artifactory ----------
+      # ---------- 5) PUSH & RECORD BUILD-INFO ----------
       - name: Docker login (Artifactory via JF CLI)
+        shell: bash
         run: jf docker-login ${{ env.JF_REGISTRY }}
 
-      # ---------- Push via JF CLI to record build-info ----------
       - name: Push image & record build-info
+        shell: bash
         env:
           BUILD_NAME: ${{ env.BUILD_NAME }}
           BUILD_NUMBER: ${{ env.BUILD_NUMBER }}
-        shell: bash
         run: |
           jf rt docker-push "${{ steps.tags.outputs.sha_tag }}" "${{ env.DOCKER_REPO }}" \
             --build-name "${BUILD_NAME}" --build-number "${BUILD_NUMBER}"
           jf rt docker-push "${{ steps.tags.outputs.ref_tag }}" "${{ env.DOCKER_REPO }}" \
             --build-name "${BUILD_NAME}" --build-number "${BUILD_NUMBER}"
 
-      # ---------- Publish build-info ----------
       - name: Publish build-info
+        shell: bash
         env:
           BUILD_NAME: ${{ env.BUILD_NAME }}
           BUILD_NUMBER: ${{ env.BUILD_NUMBER }}
         run: jf rt build-publish "${BUILD_NAME}" "${BUILD_NUMBER}"
 
-      # ---------- Xray Build Scan (policy-gated) ----------
+      # ---------- 6) POLICY-GATED BUILD SCAN ----------
       - name: Scan published build (policy-gated)
+        shell: bash
         env:
           BUILD_NAME: ${{ env.BUILD_NAME }}
           BUILD_NUMBER: ${{ env.BUILD_NUMBER }}
           FAIL_ON_SEVERITY: ${{ env.FAIL_ON_SEVERITY }}
-        shell: bash
         run: |
           if [ "${FAIL_ON_SEVERITY}" = "none" ]; then
             jf bs "${BUILD_NAME}" "${BUILD_NUMBER}" || true
