@@ -89,19 +89,25 @@ jobs:
       - name: Image scan (Xray; local with pull fallback)
         shell: bash
         env:
-          IMG_TAG: ${{ steps.tags.outputs.sha_tag }}
+          IMG_TAG: ${{ steps.tags.outputs.sha_tag }}      # e.g., aboavent.jfrog.io/myrepo-docker/notes-api:<sha>
           XRAY_FORMAT: ${{ env.XRAY_FORMAT }}
           JF_REGISTRY: ${{ env.JF_REGISTRY }}
         run: |
           set -euo pipefail
-          if docker image inspect "${IMG_TAG}" >/dev/null 2>&1; then
-            echo "Scanning local image: ${IMG_TAG}"
-          else
-            echo "Local image not found. Pulling from registry, then scanning..."
+          echo "Verifying local image:"
+          docker image inspect "${IMG_TAG}" >/dev/null 2>&1 || {
+            echo "Local image not found. Pulling from registry..."
             jf docker-login "${JF_REGISTRY}"
             docker pull "${IMG_TAG}"
+          }
+      
+          echo "Scanning with Xray (local daemon)…"
+          # Use --type docker instead of docker:// scheme
+          if ! jf scan --type docker "${IMG_TAG}" --fail=false --format "${XRAY_FORMAT}"; then
+            echo "Direct scan failed; saving image to tar and scanning tar as fallback…"
+            docker save "${IMG_TAG}" -o image.tar
+            jf scan image.tar --fail=false --format "${XRAY_FORMAT}"
           fi
-          jf scan "docker://${IMG_TAG}" --fail=false --format "${XRAY_FORMAT}"
 
       # ---------- 5) PUSH & RECORD BUILD-INFO ----------
       - name: Docker login (Artifactory via JF CLI)
