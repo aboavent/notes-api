@@ -1,4 +1,4 @@
-name: "JFrog OIDC CI Workflow with Curation + Xray (Docker)"
+name: "JFrog OIDC CI Workflow with Curation + Xray (Docker + Python + Artifacts)"
 
 on:
   push:
@@ -10,24 +10,19 @@ permissions:
 
 env:
   PYTHON_VERSION: ${{ vars.PYTHON_VERSION || '3.11' }}
-  BUILD_NAME: ${{ vars.BUILD_NAME || 'jfrog-docker-security-scan-build' }}
-  BUILD_NUMBER: ${{ vars.BUILD_NUMBER || github.run_id }}
-
-  # Artifactory / repos
-  DOCKER_REPO: ${{ vars.DOCKER_REPO  || 'notes-api-docker-repo' }}
-  JF_REGISTRY: ${{ vars.JF_REGISTRY  || 'aboavent.jfrog.io' }}         # host only
+  BUILD_NAME:     ${{ vars.BUILD_NAME     || 'jfrog-docker-security-scan-build' }}
+  BUILD_NUMBER:   ${{ vars.BUILD_NUMBER   || github.run_id }}
+  # Artifactory / Xray
+  DOCKER_REPO:    ${{ vars.DOCKER_REPO    || 'notes-api-docker-repo' }}
+  JF_REGISTRY:    ${{ vars.JF_REGISTRY    || 'aboavent.jfrog.io' }}    # host only (no https)
   CURATED_PYPI_VIRTUAL: ${{ vars.CURATED_PYPI_VIRTUAL || 'notes-api-pypi-curated' }}
-
-  # Xray behavior
   FAIL_ON_SEVERITY: ${{ vars.FAIL_ON_SEVERITY || 'none' }}              # none|low|medium|high|critical
   XRAY_FORMAT: table
-
-  # Quieter CLI logs + nice command summary
-  JFROG_CLI_LOG_LEVEL: ERROR
-  JFROG_CLI_ENV_EXCLUDE: "*password*;*secret*;*key*;*token*;*auth*;JF_ARTIFACTORY_*;JF_ENV_*;JF_URL;JF_USER;JF_PASSWORD;JF_ACCESS_TOKEN"
+  # Generic artifacts repo (for source snapshot & SBOM uploads)
+  ARTIFACTS_REPO: ${{ vars.ARTIFACTS_REPO || 'notes-api-generic-local' }}
 
 jobs:
-  build-scan-and-publish:
+  build-curate-scan-publish:
     runs-on: ubuntu-latest
     steps:
       - name: "Checkout"
@@ -38,27 +33,16 @@ jobs:
         env:
           JF_URL: ${{ vars.JF_URL }}                       # e.g., https://aboavent.jfrog.io
         with:
-          oidc-provider-name: github-oidc-integration
-
-      - name: "Ensure jq is available"
-        shell: bash
-        run: |
-          if ! command -v jq >/dev/null 2>&1; then
-            sudo apt-get update -y && sudo apt-get install -y jq
-          fi
+          oidc-provider-name: github-oidc-integration      # must exist in JFrog Platform
 
       - name: "Sanity: show effective settings"
         shell: bash
         run: |
           set -euo pipefail
           echo "DOCKER_REPO=${{ env.DOCKER_REPO }}"
-          jf rt curl -s -XGET "/api/repositories/${{ env.DOCKER_REPO }}" | jq '{key,packageType,type,repositories,defaultDeploymentRepo}'
-          {
-            echo "### JFrog Settings"
-            echo "- **JF_URL**: \`${{ vars.JF_URL }}\`"
-            echo "- **DOCKER_REPO**: \`${{ env.DOCKER_REPO }}\`"
-            echo "- **CURATED_PYPI_VIRTUAL**: \`${{ env.CURATED_PYPI_VIRTUAL }}\`"
-          } >> "$GITHUB_STEP_SUMMARY"
+          jf --version
+          # Show docker repo info (jq is pre-installed on ubuntu-latest)
+          jf rt curl -s -XGET "/api/repositories/${{ env.DOCKER_REPO }}" | jq '{key,packageType,type}'
 
       # ---------- Curation (pip) ----------
       - name: "Configure pip to resolve via curated PyPI (project)"
@@ -75,16 +59,6 @@ jobs:
         shell: bash
         run: jf curation-audit --requirements-file requirements.txt --format table || true
 
-      # NEW: generate a Curation UI event so it appears under Curation → Audit Events
-      - name: "Curation UI event (download via curated PyPI)"
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p .curation-cache
-          python -m pip download -r requirements.txt \
-            -i "${{ vars.JF_URL }}/artifactory/api/pypi/${{ env.CURATED_PYPI_VIRTUAL }}/simple" \
-            --dest .curation-cache || true
-
       # ---------- Build Docker image ----------
       - name: "Compose image tag"
         id: tags
@@ -96,20 +70,54 @@ jobs:
           echo "ref_tag=${REF_TAG}" >> "$GITHUB_OUTPUT"
 
       - name: "Build image (local)"
-        shell: bash
         run: |
           docker build -t "${{ steps.tags.outputs.ref_tag }}" .
 
-      # ---------- Image scan (local daemon) ----------
-      - name: "Xray image scan (local)"
+      - name: "Xray image scan (local daemon, non-blocking)"
+        shell: bash
+        run: jf docker scan "${{ steps.tags.outputs.ref_tag }}" --fail=false --format "${{ env.XRAY_FORMAT }}"
+
+      # ---------- Optional: publish repo assets to a Generic repo ----------
+      - name: "Package repo snapshot (exclude VCS/CI folders)"
         shell: bash
         run: |
           set -euo pipefail
-          echo "Scanning local image: ${{ steps.tags.outputs.ref_tag }}"
-          jf docker scan "${{ steps.tags.outputs.ref_tag }}" --fail=false --format "${{ env.XRAY_FORMAT }}"
+          SNAP="notes-api-${GITHUB_SHA}.tar.gz"
+          tar -czf "$SNAP" --exclude .git --exclude .github --exclude .jfrog .
+          ls -lh "$SNAP"
+
+      - name: "Upload snapshot to Generic repo"
+        env:
+          BUILD_NAME:   ${{ env.BUILD_NAME }}
+          BUILD_NUMBER: ${{ env.BUILD_NUMBER }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          SNAP="notes-api-${GITHUB_SHA}.tar.gz"
+          jf rt u "$SNAP" "${{ env.ARTIFACTS_REPO }}/snapshots/${GITHUB_REF_NAME}/" \
+            --props "app=notes-api;vcs.revision=${GITHUB_SHA}" \
+            --build-name "${BUILD_NAME}" --build-number "${BUILD_NUMBER}"
+
+      - name: "Create CycloneDX SBOM from source"
+        shell: bash
+        run: |
+          set -euo pipefail
+          jf scan . --fail=false --format cyclonedx > sbom.cdx.json
+          test -s sbom.cdx.json && echo "SBOM created"
+
+      - name: "Upload SBOM to Generic repo"
+        env:
+          BUILD_NAME:   ${{ env.BUILD_NAME }}
+          BUILD_NUMBER: ${{ env.BUILD_NUMBER }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          jf rt u "sbom.cdx.json" "${{ env.ARTIFACTS_REPO }}/sbom/${GITHUB_REF_NAME}/" \
+            --props "type=sbom;format=cyclonedx;app=notes-api;vcs.revision=${GITHUB_SHA}" \
+            --build-name "${BUILD_NAME}" --build-number "${BUILD_NUMBER}"
 
       # ---------- Push & record build-info ----------
-      - name: "Push image & record build-info (ref tag only)"
+      - name: "Push image & record build-info (ref tag)"
         env:
           BUILD_NAME:   ${{ env.BUILD_NAME }}
           BUILD_NUMBER: ${{ env.BUILD_NUMBER }}
@@ -128,8 +136,8 @@ jobs:
       # ---------- Xray Build Scan (policy-gated) ----------
       - name: "Scan published build (policy-gated)"
         env:
-          BUILD_NAME:       ${{ env.BUILD_NAME }}
-          BUILD_NUMBER:     ${{ env.BUILD_NUMBER }}
+          BUILD_NAME:   ${{ env.BUILD_NAME }}
+          BUILD_NUMBER: ${{ env.BUILD_NUMBER }}
           FAIL_ON_SEVERITY: ${{ env.FAIL_ON_SEVERITY }}
         shell: bash
         run: |
@@ -159,3 +167,21 @@ jobs:
             echo "- **Medium**: ${MED}"
             echo "- **Low**: ${LOW}"
           } >> "$GITHUB_STEP_SUMMARY"
+
+      # ---------- (Optional) Python package publish to PyPI-local ----------
+      - name: "Build & publish Python package to PyPI-local (if pyproject.toml exists)"
+        if: hashFiles('pyproject.toml') != ''
+        env:
+          BUILD_NAME:   ${{ env.BUILD_NAME }}
+          BUILD_NUMBER: ${{ env.BUILD_NUMBER }}
+          PIPY_LOCAL:   ${{ vars.PIPY_LOCAL || 'pypi-local' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip build
+          python -m build
+          # Configure pip for deployment (uses same server id from setup action)
+          jf pip-config --repo-deploy "${PIPY_LOCAL}" --server-id-deploy "setup-jfrog-cli-server" --global=false
+          # Upload with build-info
+          jf rt u "dist/*" "${PIPY_LOCAL}/" \
+            --build-name "${BUILD_NAME}" --build-number "${BUILD_NUMBER}"
