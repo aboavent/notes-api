@@ -76,14 +76,11 @@ jobs:
           set -euo pipefail
           # project-level config (writes .jfrog/pip.yaml)
           jf pip-config \
-            --repo-resolve "${{ env.CURATED_PYPI_VIRTUAL }}" \
-            --server-id-resolve "setup-jfrog-cli-server" \
-            --global=false
-          find .jfrog -maxdepth 3 -type f -print || true
+            --repo-resolve "${{ env.CURATED_PYPI_VIRTUAL }}"
 
       - name: "Curation audit (requirements.txt)"
         shell: bash
-        run: jf curation-audit --requirements-file requirements.txt --format table || true
+        run: jf curation-audit --format table 
 
       # ---------- Build Docker image ----------
       - name: "Compose image tag"
