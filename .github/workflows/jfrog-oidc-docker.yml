@@ -10,16 +10,19 @@ permissions:
 
 env:
   PYTHON_VERSION: ${{ vars.PYTHON_VERSION || '3.11' }}
-  BUILD_NAME: ${{ vars.BUILD_NAME || github.workflow }}
-  BUILD_NUMBER: ${{ vars.BUILD_NUMBER || github.run_id }}
-  DOCKER_REPO: ${{ vars.DOCKER_REPO || 'notes-api-docker-repo' }}
-  JF_REGISTRY: ${{ vars.JF_REGISTRY || 'aboavent.jfrog.io' }}     # host only
+  BUILD_NAME:     ${{ vars.BUILD_NAME     || 'jfrog-docker-security-scan-build' }}
+  BUILD_NUMBER:   ${{ vars.BUILD_NUMBER   || github.run_id }}
+  # Artifactory
+  DOCKER_REPO:    ${{ vars.DOCKER_REPO    || 'notes-api-docker-repo' }}
+  JF_REGISTRY:    ${{ vars.JF_REGISTRY    || 'aboavent.jfrog.io' }}   # host only
   CURATED_PYPI_VIRTUAL: ${{ vars.CURATED_PYPI_VIRTUAL || 'pypi-curated' }}
-  FAIL_ON_SEVERITY: ${{ vars.FAIL_ON_SEVERITY || 'none' }}         # none|low|medium|high|critical
+  # Xray behavior
+  FAIL_ON_SEVERITY: ${{ vars.FAIL_ON_SEVERITY || 'none' }}             # none|low|medium|high|critical
   XRAY_FORMAT: table
+  # Quiet the CLI
   JFROG_CLI_LOG_LEVEL: ERROR
-  JFROG_CLI_OFFER_CONFIG: false
   JFROG_CLI_ENV_EXCLUDE: "*password*;*secret*;*key*;*token*;*auth*;JF_ARTIFACTORY_*;JF_ENV_*;JF_URL;JF_USER;JF_PASSWORD;JF_ACCESS_TOKEN"
+  JFROG_CLI_OFFER_CONFIG: "false"
 
 jobs:
   build-scan-and-publish:
@@ -31,7 +34,7 @@ jobs:
       - name: Setup JFrog CLI (OIDC)
         uses: jfrog/setup-jfrog-cli@v4
         env:
-          JF_URL: ${{ vars.JF_URL }}                                # e.g., https://aboavent.jfrog.io
+          JF_URL: ${{ vars.JF_URL }}                        # e.g. https://aboavent.jfrog.io
         with:
           oidc-provider-name: github-oidc-integration
 
@@ -47,25 +50,34 @@ jobs:
         run: |
           set -euo pipefail
           echo "DOCKER_REPO=${{ env.DOCKER_REPO }}"
-          jf rt curl -s -XGET "/api/repositories/${{ env.DOCKER_REPO }}" | jq '{key,packageType,type,repositories,defaultDeploymentRepo}'
+          jf rt curl -s -XGET "/api/repositories/${{ env.DOCKER_REPO }}" | jq '{key,packageType,type,repositories,defaultDeploymentRepo}' || true
           {
             echo "### JFrog Settings"
             echo "- **JF_URL**: \`${{ vars.JF_URL }}\`"
             echo "- **DOCKER_REPO**: \`${{ env.DOCKER_REPO }}\`"
+            echo "- **JF_REGISTRY**: \`${{ env.JF_REGISTRY }}\`"
+            echo "- **CURATED_PYPI_VIRTUAL**: \`${{ env.CURATED_PYPI_VIRTUAL }}\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
-      # ---------- Curation (pre-resolve) ----------
-      - name: Curation audit (requirements.txt)
+      # ---------- Curation ----------
+      - name: Configure pip (JFrog)
         shell: bash
         run: |
-          jf curation-audit --requirements-file requirements.txt --format table || true
+          jf pip c \
+            --global \
+            --server-id-resolve setup-jfrog-cli-server \
+            --repo-resolve "${{ env.CURATED_PYPI_VIRTUAL }}"
 
-      # ---------- Source scan: SAST / Secrets / IaC (non-blocking) ----------
+      - name: Curation audit (requirements.txt)
+        shell: bash
+        run: jf curation-audit --requirements-file requirements.txt --format table || true
+
+      # ---------- Source scan (non-blocking) ----------
       - name: Scan repository (non-blocking)
         shell: bash
         run: jf scan . --fail=false --format "${{ env.XRAY_FORMAT }}"
 
-      # ---------- Build Docker image (tag = branch) ----------
+      # ---------- Build Docker image ----------
       - name: Compose image tag
         id: tags
         shell: bash
@@ -75,17 +87,18 @@ jobs:
           REF_TAG="${{ env.JF_REGISTRY }}/${{ env.DOCKER_REPO }}/${NAME}:${SAFE_BRANCH}"
           echo "ref_tag=${REF_TAG}" >> "$GITHUB_OUTPUT"
 
-      - name: Build image
+      - name: Build image (local)
         shell: bash
-        run: docker build -t "${{ steps.tags.outputs.ref_tag }}" .
+        run: |
+          docker build -t "${{ steps.tags.outputs.ref_tag }}" .
 
-      # ---------- Xray image scan (local daemon, non-blocking) ----------
-      - name: Docker image scan (local, non-blocking)
+      # ---------- Local image scan (Xray) ----------
+      - name: Image scan (Xray, local daemon)
         shell: bash
         run: jf docker scan "${{ steps.tags.outputs.ref_tag }}" --fail=false --format "${{ env.XRAY_FORMAT }}"
 
-      # ---------- Push & record build-info (branch tag only) ----------
-      - name: Push image & record build-info
+      # ---------- Push & record build-info ----------
+      - name: Push image & record build-info (ref tag only)
         env:
           BUILD_NAME:   ${{ env.BUILD_NAME }}
           BUILD_NUMBER: ${{ env.BUILD_NUMBER }}
@@ -99,7 +112,6 @@ jobs:
         env:
           BUILD_NAME:   ${{ env.BUILD_NAME }}
           BUILD_NUMBER: ${{ env.BUILD_NUMBER }}
-        shell: bash
         run: jf rt build-publish "${BUILD_NAME}" "${BUILD_NUMBER}"
 
       # ---------- Xray Build Scan (policy-gated) ----------
@@ -116,7 +128,6 @@ jobs:
             jf bs "${BUILD_NAME}" "${BUILD_NUMBER}" --fail-on-severity "${FAIL_ON_SEVERITY}"
           fi
 
-      # ---------- Job summary ----------
       - name: Summarize Xray build scan in job summary
         env:
           BUILD_NAME:   ${{ env.BUILD_NAME }}
