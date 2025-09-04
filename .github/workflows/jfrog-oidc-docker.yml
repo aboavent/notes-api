@@ -14,7 +14,7 @@ env:
   BUILD_NUMBER:   ${{ vars.BUILD_NUMBER   || github.run_id }}
   DOCKER_REPO:    ${{ vars.DOCKER_REPO    || 'notes-api-docker-repo' }}
   JF_REGISTRY:    ${{ vars.JF_REGISTRY    || 'aboavent.jfrog.io' }}     # host only
-  CURATED_PYPI_VIRTUAL: ${{ vars.CURATED_PYPI_VIRTUAL || 'notes-api-pipy-curated' }}
+  CURATED_PYPI_VIRTUAL: ${{ vars.CURATED_PYPI_VIRTUAL || 'notes-api-pypi-curated' }}
   FAIL_ON_SEVERITY: ${{ vars.FAIL_ON_SEVERITY || 'none' }}               # none|Low|Medium|High|Critical
   XRAY_FORMAT: table
 
