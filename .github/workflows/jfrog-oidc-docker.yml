@@ -9,24 +9,27 @@ permissions:
   contents: read
 
 env:
+  # Versions / build metadata
   PYTHON_VERSION: ${{ vars.PYTHON_VERSION || '3.11' }}
-  BUILD_NAME:     ${{ vars.BUILD_NAME     || 'jfrog-docker-security-scan-build' }}
+  BUILD_NAME:     ${{ vars.BUILD_NAME     || 'notes-api:main' }}
   BUILD_NUMBER:   ${{ vars.BUILD_NUMBER   || github.run_id }}
-  # Artifactory
-  DOCKER_REPO:    ${{ vars.DOCKER_REPO    || 'notes-api-docker-repo' }}
-  JF_REGISTRY:    ${{ vars.JF_REGISTRY    || 'aboavent.jfrog.io' }}   # host only
-  CURATED_PYPI_VIRTUAL: ${{ vars.CURATED_PYPI_VIRTUAL || 'pypi-curated' }}
+
+  # Artifactory registry & repo
+  JF_REGISTRY: ${{ vars.JF_REGISTRY || 'aboavent.jfrog.io' }}       # host only
+  DOCKER_REPO: ${{ vars.DOCKER_REPO || 'notes-api-docker-repo' }}   # local Docker repo
+
   # Xray behavior
-  FAIL_ON_SEVERITY: ${{ vars.FAIL_ON_SEVERITY || 'none' }}             # none|low|medium|high|critical
+  FAIL_ON_SEVERITY: ${{ vars.FAIL_ON_SEVERITY || 'none' }}           # none|low|medium|high|critical
   XRAY_FORMAT: table
-  # Quiet the CLI
-  JFROG_CLI_LOG_LEVEL: ERROR
-  JFROG_CLI_ENV_EXCLUDE: "*password*;*secret*;*key*;*token*;*auth*;JF_ARTIFACTORY_*;JF_ENV_*;JF_URL;JF_USER;JF_PASSWORD;JF_ACCESS_TOKEN"
-  JFROG_CLI_OFFER_CONFIG: "false"
+
+  # Curation (PyPI) – optional audit
+  CURATED_PYPI_VIRTUAL: ${{ vars.CURATED_PYPI_VIRTUAL || 'pypi-curated' }}
+  REQUIREMENTS_FILE: ${{ vars.REQUIREMENTS_FILE || 'requirements.txt' }}
 
 jobs:
   build-scan-and-publish:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -34,7 +37,7 @@ jobs:
       - name: Setup JFrog CLI (OIDC)
         uses: jfrog/setup-jfrog-cli@v4
         env:
-          JF_URL: ${{ vars.JF_URL }}                        # e.g. https://aboavent.jfrog.io
+          JF_URL: ${{ vars.JF_URL }}                      # e.g., https://aboavent.jfrog.io
         with:
           oidc-provider-name: github-oidc-integration
 
@@ -50,32 +53,32 @@ jobs:
         run: |
           set -euo pipefail
           echo "DOCKER_REPO=${{ env.DOCKER_REPO }}"
-          jf rt curl -s -XGET "/api/repositories/${{ env.DOCKER_REPO }}" | jq '{key,packageType,type,repositories,defaultDeploymentRepo}' || true
+          jf rt curl -s -XGET "/api/repositories/${{ env.DOCKER_REPO }}" | jq '{key,packageType,type,repositories,defaultDeploymentRepo}'
           {
             echo "### JFrog Settings"
             echo "- **JF_URL**: \`${{ vars.JF_URL }}\`"
             echo "- **DOCKER_REPO**: \`${{ env.DOCKER_REPO }}\`"
-            echo "- **JF_REGISTRY**: \`${{ env.JF_REGISTRY }}\`"
-            echo "- **CURATED_PYPI_VIRTUAL**: \`${{ env.CURATED_PYPI_VIRTUAL }}\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
-      # ---------- Curation ----------
-      - name: Configure pip (JFrog)
+      # ---------- Curation (advisory audit of requirements) ----------
+      - name: Init pip resolver for Curation (idempotent)
         shell: bash
         run: |
-          jf pip c \
-            --global \
-            --server-id-resolve setup-jfrog-cli-server \
-            --repo-resolve "${{ env.CURATED_PYPI_VIRTUAL }}"
+          # Configure pip to resolve via curated PyPI (first run creates config; safe to re-run)
+          jf pip c --repo-resolve="${{ env.CURATED_PYPI_VIRTUAL }}" --server-id-resolve=setup-jfrog-cli-server || true
 
-      - name: Curation audit (requirements.txt)
+      - name: Curation audit (non-blocking)
         shell: bash
-        run: jf curation-audit --requirements-file requirements.txt --format table || true
-
-      # ---------- Source scan (non-blocking) ----------
-      - name: Scan repository (non-blocking)
-        shell: bash
-        run: jf scan . --fail=false --format "${{ env.XRAY_FORMAT }}"
+        run: |
+          set -euo pipefail
+          FILE="${{ env.REQUIREMENTS_FILE }}"
+          if [ ! -f "$FILE" ]; then
+            if [ -f app/requirements.txt ]; then FILE="app/requirements.txt"; else
+              echo "No requirements.txt found, skipping curation audit."; exit 0
+            fi
+          fi
+          echo "Auditing with Curation: $FILE"
+          jf curation-audit --requirements-file "$FILE" --format table || true
 
       # ---------- Build Docker image ----------
       - name: Compose image tag
@@ -87,18 +90,18 @@ jobs:
           REF_TAG="${{ env.JF_REGISTRY }}/${{ env.DOCKER_REPO }}/${NAME}:${SAFE_BRANCH}"
           echo "ref_tag=${REF_TAG}" >> "$GITHUB_OUTPUT"
 
-      - name: Build image (local)
+      - name: Build image
         shell: bash
         run: |
           docker build -t "${{ steps.tags.outputs.ref_tag }}" .
 
-      # ---------- Local image scan (Xray) ----------
-      - name: Image scan (Xray, local daemon)
+      # ---------- Xray image scan (local daemon, non-blocking) ----------
+      - name: Image scan (Xray, local image)
         shell: bash
         run: jf docker scan "${{ steps.tags.outputs.ref_tag }}" --fail=false --format "${{ env.XRAY_FORMAT }}"
 
       # ---------- Push & record build-info ----------
-      - name: Push image & record build-info (ref tag only)
+      - name: Push image & record build-info (ref tag)
         env:
           BUILD_NAME:   ${{ env.BUILD_NAME }}
           BUILD_NUMBER: ${{ env.BUILD_NUMBER }}
@@ -112,6 +115,7 @@ jobs:
         env:
           BUILD_NAME:   ${{ env.BUILD_NAME }}
           BUILD_NUMBER: ${{ env.BUILD_NUMBER }}
+        shell: bash
         run: jf rt build-publish "${BUILD_NAME}" "${BUILD_NUMBER}"
 
       # ---------- Xray Build Scan (policy-gated) ----------
