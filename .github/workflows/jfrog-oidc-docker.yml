@@ -28,7 +28,7 @@ jobs:
       - name: Setup JFrog CLI (OIDC)
         uses: jfrog/setup-jfrog-cli@v4
         env:
-          JF_URL: ${{ vars.JF_URL }}                # e.g., https://aboavent.jfrog.io
+          JF_URL: ${{ vars.JF_URL }}
         with:
           oidc-provider-name: github-oidc-integration
 
@@ -58,12 +58,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # You can use either 'jf pip-config' or the alias 'jf pip c'
           jf pip-config \
             --repo-resolve "${{ env.CURATED_PYPI_VIRTUAL }}" \
             --server-id-resolve "setup-jfrog-cli-server" \
-            --global=false \
-            --interactive=false
-          # Show resulting project config
+            --global=false
           find .jfrog -maxdepth 3 -type f -print || true
 
       - name: Curation audit (requirements.txt)
