@@ -17,7 +17,7 @@ env:
   DOCKER_REPO:  ${{ vars.DOCKER_REPO  || 'notes-api-docker-repo' }}
   JF_REGISTRY:  ${{ vars.JF_REGISTRY  || 'aboavent.jfrog.io' }}   # host only (no https)
 
-  # Curation (set this to your curated *virtual* PyPI repo name)
+  # Curation (curated *virtual* PyPI repo)
   CURATED_PYPI_VIRTUAL: ${{ vars.CURATED_PYPI_VIRTUAL || 'pypi-curated' }}
 
   # Xray behavior
@@ -44,7 +44,7 @@ jobs:
         with:
           oidc-provider-name: github-oidc-integration # must exist in JFrog Platform
 
-      - name: Sanity: show effective settings
+      - name: "Sanity: show effective settings"
         shell: bash
         run: |
           set -euo pipefail
@@ -62,7 +62,6 @@ jobs:
         working-directory: app
         shell: bash
         run: |
-          # 'setup-jfrog-cli' action registers a server id named: setup-jfrog-cli-server
           jf pipc \
             --server-id-resolve setup-jfrog-cli-server \
             --repo-resolve "${{ env.CURATED_PYPI_VIRTUAL }}"
@@ -71,7 +70,6 @@ jobs:
         working-directory: app
         shell: bash
         run: |
-          # Fails the job if any dependency is blocked by Curation policy
           jf curation-audit --requirements-file requirements.txt --format table
 
       # ---------- Build & tag image ----------
@@ -80,9 +78,9 @@ jobs:
         shell: bash
         run: |
           NAME="notes-api"
-          SHA_TAG="${{ env.JF_REGISTRY }}/${{ env.DOCKER_REPO }}/${NAME}:${GITHUB_SHA}"
+          SHA_TAG="${{ env.JF_REGISTRY }}/${{ env.DOCTOR_REPO || env.DOCKER_REPO }}/${NAME}:${GITHUB_SHA}"
           SAFE_BRANCH=$(echo "${GITHUB_REF_NAME:-main}" | tr '/ ' '--')
-          REF_TAG="${{ env.JF_REGISTRY }}/${{ env.DOCKER_REPO }}/${NAME}:${SAFE_BRANCH}"
+          REF_TAG="${{ env.JF_REGISTRY }}/${{ env.DOCTOR_REPO || env.DOCKER_REPO }}/${NAME}:${SAFE_BRANCH}"
           echo "sha_tag=${SHA_TAG}" >> "$GITHUB_OUTPUT"
           echo "ref_tag=${REF_TAG}" >> "$GITHUB_OUTPUT"
 
