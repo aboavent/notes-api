@@ -9,27 +9,18 @@ permissions:
   contents: read
 
 env:
-  # Versions / build metadata
   PYTHON_VERSION: ${{ vars.PYTHON_VERSION || '3.11' }}
-  BUILD_NAME:     ${{ vars.BUILD_NAME     || 'notes-api:main' }}
+  BUILD_NAME:     ${{ vars.BUILD_NAME     || 'jfrog-docker-security-scan-build' }}
   BUILD_NUMBER:   ${{ vars.BUILD_NUMBER   || github.run_id }}
-
-  # Artifactory registry & repo
-  JF_REGISTRY: ${{ vars.JF_REGISTRY || 'aboavent.jfrog.io' }}       # host only
-  DOCKER_REPO: ${{ vars.DOCKER_REPO || 'notes-api-docker-repo' }}   # local Docker repo
-
-  # Xray behavior
-  FAIL_ON_SEVERITY: ${{ vars.FAIL_ON_SEVERITY || 'none' }}           # none|low|medium|high|critical
+  DOCKER_REPO:    ${{ vars.DOCKER_REPO    || 'notes-api-docker-repo' }}
+  JF_REGISTRY:    ${{ vars.JF_REGISTRY    || 'aboavent.jfrog.io' }}     # host only
+  CURATED_PYPI_VIRTUAL: ${{ vars.CURATED_PYPI_VIRTUAL || 'notes-api-pipy-curated' }}
+  FAIL_ON_SEVERITY: ${{ vars.FAIL_ON_SEVERITY || 'none' }}               # none|Low|Medium|High|Critical
   XRAY_FORMAT: table
 
-  # Curation (PyPI) – optional audit
-  CURATED_PYPI_VIRTUAL: ${{ vars.CURATED_PYPI_VIRTUAL || 'pypi-curated' }}
-  REQUIREMENTS_FILE: ${{ vars.REQUIREMENTS_FILE || 'requirements.txt' }}
-
 jobs:
-  build-scan-and-publish:
+  build-curate-scan-publish:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -37,7 +28,7 @@ jobs:
       - name: Setup JFrog CLI (OIDC)
         uses: jfrog/setup-jfrog-cli@v4
         env:
-          JF_URL: ${{ vars.JF_URL }}                      # e.g., https://aboavent.jfrog.io
+          JF_URL: ${{ vars.JF_URL }}                # e.g., https://aboavent.jfrog.io
         with:
           oidc-provider-name: github-oidc-integration
 
@@ -53,35 +44,34 @@ jobs:
         run: |
           set -euo pipefail
           echo "DOCKER_REPO=${{ env.DOCKER_REPO }}"
-          jf rt curl -s -XGET "/api/repositories/${{ env.DOCKER_REPO }}" | jq '{key,packageType,type,repositories,defaultDeploymentRepo}'
+          echo "CURATED_PYPI_VIRTUAL=${{ env.CURATED_PYPI_VIRTUAL }}"
+          jf rt curl -s -XGET "/api/repositories/${{ env.DOCKER_REPO }}" | jq '{key,packageType,type}'
           {
             echo "### JFrog Settings"
             echo "- **JF_URL**: \`${{ vars.JF_URL }}\`"
             echo "- **DOCKER_REPO**: \`${{ env.DOCKER_REPO }}\`"
+            echo "- **Curated PyPI (virtual)**: \`${{ env.CURATED_PYPI_VIRTUAL }}\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
-      # ---------- Curation (advisory audit of requirements) ----------
-      - name: Init pip resolver for Curation (idempotent)
-        shell: bash
-        run: |
-          # Configure pip to resolve via curated PyPI (first run creates config; safe to re-run)
-          jf pip c --repo-resolve="${{ env.CURATED_PYPI_VIRTUAL }}" --server-id-resolve=setup-jfrog-cli-server || true
-
-      - name: Curation audit (non-blocking)
+      # ---------- Curation (pip) ----------
+      - name: Configure pip to resolve via curated PyPI (project)
         shell: bash
         run: |
           set -euo pipefail
-          FILE="${{ env.REQUIREMENTS_FILE }}"
-          if [ ! -f "$FILE" ]; then
-            if [ -f app/requirements.txt ]; then FILE="app/requirements.txt"; else
-              echo "No requirements.txt found, skipping curation audit."; exit 0
-            fi
-          fi
-          echo "Auditing with Curation: $FILE"
-          jf curation-audit --requirements-file "$FILE" --format table || true
+          jf pip-config \
+            --repo-resolve "${{ env.CURATED_PYPI_VIRTUAL }}" \
+            --server-id-resolve "setup-jfrog-cli-server" \
+            --global=false \
+            --interactive=false
+          # Show resulting project config
+          find .jfrog -maxdepth 3 -type f -print || true
+
+      - name: Curation audit (requirements.txt)
+        shell: bash
+        run: jf curation-audit --requirements-file requirements.txt --format table || true
 
       # ---------- Build Docker image ----------
-      - name: Compose image tag
+      - name: Compose image tag (ref)
         id: tags
         shell: bash
         run: |
@@ -90,15 +80,18 @@ jobs:
           REF_TAG="${{ env.JF_REGISTRY }}/${{ env.DOCKER_REPO }}/${NAME}:${SAFE_BRANCH}"
           echo "ref_tag=${REF_TAG}" >> "$GITHUB_OUTPUT"
 
-      - name: Build image
+      - name: Build image (local)
         shell: bash
         run: |
           docker build -t "${{ steps.tags.outputs.ref_tag }}" .
 
-      # ---------- Xray image scan (local daemon, non-blocking) ----------
-      - name: Image scan (Xray, local image)
+      # ---------- Image scan with Xray (local daemon, non-blocking) ----------
+      - name: Xray image scan (non-blocking)
         shell: bash
-        run: jf docker scan "${{ steps.tags.outputs.ref_tag }}" --fail=false --format "${{ env.XRAY_FORMAT }}"
+        run: |
+          set -euo pipefail
+          echo "Scanning local image: ${{ steps.tags.outputs.ref_tag }}"
+          jf docker scan "${{ steps.tags.outputs.ref_tag }}" --format "${{ env.XRAY_FORMAT }}" || true
 
       # ---------- Push & record build-info ----------
       - name: Push image & record build-info (ref tag)
@@ -126,12 +119,14 @@ jobs:
           FAIL_ON_SEVERITY: ${{ env.FAIL_ON_SEVERITY }}
         shell: bash
         run: |
+          set -euo pipefail
           if [ "${FAIL_ON_SEVERITY}" = "none" ]; then
             jf bs "${BUILD_NAME}" "${BUILD_NUMBER}" || true
           else
             jf bs "${BUILD_NAME}" "${BUILD_NUMBER}" --fail-on-severity "${FAIL_ON_SEVERITY}"
           fi
 
+      # ---------- Summarize Xray build scan ----------
       - name: Summarize Xray build scan in job summary
         env:
           BUILD_NAME:   ${{ env.BUILD_NAME }}
