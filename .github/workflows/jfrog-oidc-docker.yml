@@ -9,20 +9,17 @@ permissions:
   contents: read
 
 env:
-  PYTHON_VERSION: ${{ vars.PYTHON_VERSION || '3.11' }}
-  BUILD_NAME:      ${{ vars.BUILD_NAME      || 'jfrog-docker-security-scan-build' }}
-  BUILD_NUMBER:    ${{ vars.BUILD_NUMBER    || github.run_id }}
-  # Artifactory / Repos
-  JF_REGISTRY:     ${{ vars.JF_REGISTRY     || 'aboavent.jfrog.io' }}       # host only (no https)
-  DOCKER_REPO:     ${{ vars.DOCKER_REPO     || 'notes-api-docker-repo' }}
-  CURATED_PYPI_VIRTUAL: ${{ vars.CURATED_PYPI_VIRTUAL || 'notes-api-pypi-curated' }}
-  PYPI_LOCAL_REPO:      ${{ vars.PYPI_LOCAL_REPO      || 'notes-api-pypi-local' }}
-  # Scanning behavior
-  FAIL_ON_SEVERITY: ${{ vars.FAIL_ON_SEVERITY || 'none' }}  # none|low|medium|high|critical
-  XRAY_FORMAT:      table
-  # JFrog CLI quality-of-life
-  JFROG_CLI_LOG_LEVEL: ERROR
-  JFROG_CLI_OFFER_CONFIG: "false"
+  PYTHON_VERSION:           ${{ vars.PYTHON_VERSION || '3.11' }}
+  BUILD_NAME:               ${{ vars.BUILD_NAME      || 'jfrog-docker-security-scan-build' }}
+  BUILD_NUMBER:             ${{ vars.BUILD_NUMBER    || github.run_id }}
+  JF_REGISTRY:              ${{ vars.JF_REGISTRY     || 'aboavent.jfrog.io' }}   # host only
+  DOCKER_REPO:              ${{ vars.DOCKER_REPO     || 'notes-api-docker-repo' }}
+  CURATED_PYPI_VIRTUAL:     ${{ vars.CURATED_PYPI_VIRTUAL || 'notes-api-pypi-curated' }}
+  PYPI_LOCAL_REPO:          ${{ vars.PYPI_LOCAL_REPO      || 'notes-api-pypi-local' }}
+  FAIL_ON_SEVERITY:         ${{ vars.FAIL_ON_SEVERITY || 'none' }}  # none|low|medium|high|critical
+  XRAY_FORMAT:              table
+  JFROG_CLI_LOG_LEVEL:      ERROR
+  JFROG_CLI_OFFER_CONFIG:   "false"
 
 jobs:
   build-scan-and-publish:
@@ -36,7 +33,7 @@ jobs:
         env:
           JF_URL: ${{ vars.JF_URL }}                      # e.g., https://aboavent.jfrog.io
         with:
-          oidc-provider-name: github-oidc-integration     # must exist in JFrog Platform
+          oidc-provider-name: github-oidc-integration
 
       - name: Ensure jq is available
         run: |
@@ -62,15 +59,23 @@ jobs:
         run: jf scan . --fail=false --format "${{ env.XRAY_FORMAT }}"
 
       # ---------- Curation (pip) ----------
-      - name: Configure pip to resolve via curated PyPI (project)
+      - name: Configure pip to resolve via curated PyPI (project + global fallback)
         shell: bash
         run: |
           set -euo pipefail
+          # Project-level config (preferred)
           jf pip c \
             --repo-resolve "${{ env.CURATED_PYPI_VIRTUAL }}" \
             --server-id-resolve "setup-jfrog-cli-server" \
             --global=false
+          # Global fallback (ensures jf audit can always find config)
+          jf pip c \
+            --repo-resolve "${{ env.CURATED_PYPI_VIRTUAL }}" \
+            --server-id-resolve "setup-jfrog-cli-server" \
+            --global=true
+          # Show what got written (if any)
           find .jfrog -maxdepth 3 -type f -print || true
+          ls -la "$HOME/.jfrog" || true
 
       - name: Curation audit (requirements.txt)
         shell: bash
@@ -105,7 +110,7 @@ jobs:
       - name: Image scan (Xray, non-blocking)
         run: jf docker scan "${{ steps.tags.outputs.ref_tag }}" --fail=false --format "${{ env.XRAY_FORMAT }}"
 
-      # ---------- Push & record build-info (ref tag only) ----------
+      # ---------- Push & record build-info (ref tag) ----------
       - name: Push image & record build-info (ref tag)
         env:
           BUILD_NAME:   ${{ env.BUILD_NAME }}
