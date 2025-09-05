@@ -10,19 +10,16 @@ permissions:
 
 env:
   PYTHON_VERSION: ${{ vars.PYTHON_VERSION || '3.11' }}
-  BUILD_NAME:     ${{ vars.BUILD_NAME     || 'jfrog-docker-security-scan-build' }}
-  BUILD_NUMBER:   ${{ vars.BUILD_NUMBER   || github.run_id }}
-
-  # Registries / repos
-  JF_REGISTRY:    ${{ vars.JF_REGISTRY    || 'aboavent.jfrog.io' }}        # host only
-  DOCKER_REPO:    ${{ vars.DOCKER_REPO    || 'notes-api-docker-repo' }}    # Docker repo key in Artifactory
+  BUILD_NAME:      ${{ vars.BUILD_NAME      || 'jfrog-docker-security-scan-build' }}
+  BUILD_NUMBER:    ${{ vars.BUILD_NUMBER    || github.run_id }}
+  # Artifactory / Repos
+  JF_REGISTRY:     ${{ vars.JF_REGISTRY     || 'aboavent.jfrog.io' }}       # host only (no https)
+  DOCKER_REPO:     ${{ vars.DOCKER_REPO     || 'notes-api-docker-repo' }}
   CURATED_PYPI_VIRTUAL: ${{ vars.CURATED_PYPI_VIRTUAL || 'notes-api-pypi-curated' }}
   PYPI_LOCAL_REPO:      ${{ vars.PYPI_LOCAL_REPO      || 'notes-api-pypi-local' }}
-
-  # Scanning / output
+  # Scanning behavior
   FAIL_ON_SEVERITY: ${{ vars.FAIL_ON_SEVERITY || 'none' }}  # none|low|medium|high|critical
-  XRAY_FORMAT: table
-
+  XRAY_FORMAT:      table
   # JFrog CLI quality-of-life
   JFROG_CLI_LOG_LEVEL: ERROR
   JFROG_CLI_OFFER_CONFIG: "false"
@@ -34,18 +31,18 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Setup JFrog CLI (OIDC)
+        uses: jfrog/setup-jfrog-cli@v4
+        env:
+          JF_URL: ${{ vars.JF_URL }}                      # e.g., https://aboavent.jfrog.io
+        with:
+          oidc-provider-name: github-oidc-integration     # must exist in JFrog Platform
+
       - name: Ensure jq is available
         run: |
           if ! command -v jq >/dev/null 2>&1; then
             sudo apt-get update -y && sudo apt-get install -y jq
           fi
-
-      - name: Setup JFrog CLI (OIDC)
-        uses: jfrog/setup-jfrog-cli@v4
-        env:
-          JF_URL: ${{ vars.JF_URL }}  # e.g., https://aboavent.jfrog.io
-        with:
-          oidc-provider-name: github-oidc-integration
 
       - name: "Sanity: show effective settings"
         shell: bash
@@ -57,9 +54,10 @@ jobs:
             echo "### JFrog Settings"
             echo "- **JF_URL**: \`${{ vars.JF_URL }}\`"
             echo "- **DOCKER_REPO**: \`${{ env.DOCKER_REPO }}\`"
+            echo "- **CURATED_PYPI_VIRTUAL**: \`${{ env.CURATED_PYPI_VIRTUAL }}\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
-      # ---------- Source scan: SAST / Secrets / IaC (non-blocking) ----------
+      # ---------- Source scan: SAST/Secrets/IaC (non-blocking) ----------
       - name: Scan repository (non-blocking)
         run: jf scan . --fail=false --format "${{ env.XRAY_FORMAT }}"
 
@@ -68,31 +66,28 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          jf pip-config \
+          jf pip c \
             --repo-resolve "${{ env.CURATED_PYPI_VIRTUAL }}" \
-            --server-id-resolve "setup-jfrog-cli-server"
-          # show created config files
+            --server-id-resolve "setup-jfrog-cli-server" \
+            --global=false
           find .jfrog -maxdepth 3 -type f -print || true
 
-      - name: Curation audit (project)
+      - name: Curation audit (requirements.txt)
         shell: bash
-        run: jf curation-audit --format table || true
+        run: jf curation-audit --requirements-file requirements.txt --format table || true
 
-      # ---------- Build Python package (sdist + wheel) ----------
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: ${{ env.PYTHON_VERSION }}
-
-      - name: Build Python dist
+      # ---------- SCA dependency audit (Xray) ----------
+      - name: JFrog Xray dependency audit (policy-gated)
         shell: bash
         run: |
           set -euo pipefail
-          python -m pip install --upgrade pip build
-          python -m build
-          ls -lh dist || true
+          if [ "${FAIL_ON_SEVERITY}" = "none" ]; then
+            jf audit --format "${XRAY_FORMAT}" || true
+          else
+            jf audit --fail-on-severity "${FAIL_ON_SEVERITY}" --format "${XRAY_FORMAT}"
+          fi
 
-      # ---------- Build Docker image ----------
+      # ---------- Compose image tag ----------
       - name: Compose image tag
         id: tags
         shell: bash
@@ -102,16 +97,15 @@ jobs:
           REF_TAG="${{ env.JF_REGISTRY }}/${{ env.DOCKER_REPO }}/${NAME}:${SAFE_BRANCH}"
           echo "ref_tag=${REF_TAG}" >> "$GITHUB_OUTPUT"
 
+      # ---------- Build Docker image ----------
       - name: Build image (local)
-        run: |
-          docker build -t "${{ steps.tags.outputs.ref_tag }}" .
+        run: docker build -t "${{ steps.tags.outputs.ref_tag }}" .
 
-      # ---------- Local image scan with Xray (non-blocking) ----------
-      - name: Docker image scan (local daemon, non-blocking)
-        shell: bash
+      # ---------- Optional: image scan before push ----------
+      - name: Image scan (Xray, non-blocking)
         run: jf docker scan "${{ steps.tags.outputs.ref_tag }}" --fail=false --format "${{ env.XRAY_FORMAT }}"
 
-      # ---------- Push & record build-info ----------
+      # ---------- Push & record build-info (ref tag only) ----------
       - name: Push image & record build-info (ref tag)
         env:
           BUILD_NAME:   ${{ env.BUILD_NAME }}
@@ -121,21 +115,24 @@ jobs:
           jf rt docker-push "${{ steps.tags.outputs.ref_tag }}" "${{ env.DOCKER_REPO }}" \
             --build-name "${BUILD_NAME}" --build-number "${BUILD_NUMBER}"
 
-      # ---------- Publish Python package to Artifactory (PyPI local) ----------
-      - name: Upload Python dist to PyPI local (record build-info)
-        if: ${{ always() }}  # don't block Docker path if Python build produced no dists
+      # ---------- Build Python package & upload ----------
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Build wheel/sdist
+        run: |
+          python -m pip install -U pip build
+          python -m build
+
+      - name: Upload Python artifacts to PyPI local (record build-info)
         env:
           BUILD_NAME:   ${{ env.BUILD_NAME }}
           BUILD_NUMBER: ${{ env.BUILD_NUMBER }}
-        shell: bash
         run: |
-          set -euo pipefail
-          if compgen -G "dist/*" > /dev/null; then
-            jf rt upload "dist/*" "${{ env.PYPI_LOCAL_REPO }}/" \
-              --build-name "${BUILD_NAME}" --build-number "${BUILD_NUMBER}"
-          else
-            echo "No Python distributions found under dist/. Skipping upload."
-          fi
+          jf rt upload "dist/*" "${{ env.PYPI_LOCAL_REPO }}/" \
+            --build-name "${BUILD_NAME}" --build-number "${BUILD_NUMBER}"
 
       # ---------- Publish build-info ----------
       - name: Publish build-info
@@ -147,8 +144,8 @@ jobs:
       # ---------- Xray Build Scan (policy-gated) ----------
       - name: Scan published build (policy-gated)
         env:
-          BUILD_NAME:       ${{ env.BUILD_NAME }}
-          BUILD_NUMBER:     ${{ env.BUILD_NUMBER }}
+          BUILD_NAME:   ${{ env.BUILD_NAME }}
+          BUILD_NUMBER: ${{ env.BUILD_NUMBER }}
           FAIL_ON_SEVERITY: ${{ env.FAIL_ON_SEVERITY }}
         shell: bash
         run: |
